@@ -147,7 +147,7 @@ class PS4InputHandler(Controller):
     def on_options_press(self):
         # Exit the PS4 controller thread gracefully.
         print("Exiting PS4 controller thread.")
-        sys.exit()
+        # sys.exit()
 
     # === Method to Call Signals ===
     def get_signals(self):

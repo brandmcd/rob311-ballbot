@@ -65,7 +65,7 @@ def lcm_listener(lc):
 
 def calc_enc2rad(ticks):
     # TODO [LAB-08]: Calculate the angle (radians) of the wheel given the motor encoder ticks
-    rad = 0
+    rad = (2*np.pi*ticks)/(N_ENC*N_GEARBOX)
     return rad
 
 def calc_torque_conv(Tx,Ty,Tz):
@@ -77,10 +77,10 @@ def calc_torque_conv(Tx,Ty,Tz):
 
 def calc_kinematic_conv(psi1,psi2,psi3):
     # TODO [LAB-08]: Calculate ball angular position from encoder odometry
-    phix = 0
-    phiy = 0
-    phiz = 0
-    return phix, phiy, phiz
+    phi_x = (np.sqrt(2/3))*(R_W/R_K)*(psi2 - psi3)
+    phi_y = (np.sqrt(2)/3)*(R_W/R_K)*(-2*psi1 + psi2 + psi3)
+    phi_z = (np.sqrt(2)/3)*(R_W/R_K)*(psi1 + psi2 + psi3)
+    return phi_x, phi_y, phi_z
 
 def func_clip(x,lim_lo,lim_hi):
     # A function to clip values that exceed a threshold [lim_lo,lim_hi]
@@ -126,7 +126,7 @@ def main():
         time.sleep(0.5)
         # Store variable names as header to data logged, for easier parsing in Matlab
         # TODO [IF DESIRED]: Update data header variables names to match actual data logged (at end of loop)
-        data = ["i t_now Tx Ty Tz u1 u2 u3 theta_x theta_y theta_z psi_1 psi_2 psi_3 dpsi_1 dpsi_2 dpsi_3"]
+        data = ["t_now Tx Ty Tz u1 u2 u3 dpsi_1 dpsi_2 dpsi_3 phi_x phi_y phi_z dphi_x dphi_y dphi_z"]
         dl.appendData(data)
         i = 0  # Iteration counter
         t_start = time.time()
@@ -152,6 +152,8 @@ def main():
                 # parse out individual buttons you want data from
                 js_R_x = bt_signals["js_R_x"]   # steering bot (XY) with js_R
                 js_R_y = bt_signals["js_R_y"]
+                js_L_x = bt_signals["js_L_x"]   # steering bot (XY) with js_L
+                js_L_y = bt_signals["js_L_y"]
                 trigger_L2 = bt_signals["trigger_L2"]   # spinning bot (Z) with L2/R2 triggers
                 trigger_R2 = bt_signals["trigger_R2"]
 
@@ -169,35 +171,73 @@ def main():
 
                 # Calculate motor angles from encoder ticks
                 # TODO [LAB-08]: Call method to calculate motor angles & speeds from measured encoder values
-                psi_1 = 0
-                psi_2 = 0
-                psi_3 = 0
-                dpsi_1 = 0
-                dpsi_2 = 0
-                dpsi_3 = 0
+                psi_1 = calc_enc2rad(enc_pos_1)
+                psi_2 = calc_enc2rad(enc_pos_2)
+                psi_3 = calc_enc2rad(enc_pos_3)
+                dpsi_1 = calc_enc2rad(enc_dtick_1)/(enc_dt*1e-6)
+                dpsi_2 = calc_enc2rad(enc_dtick_2)/(enc_dt*1e-6)
+                dpsi_3 = calc_enc2rad(enc_dtick_3)/(enc_dt*1e-6)
 
                 # Calculate ball's roll and translation through kinematic conversions of wheel data
                 # TODO [LAB-08]: Call method to calculate kinematic conversion of encoder-angles to ball-translations
-
+                phi_x, phi_y, phi_z = calc_kinematic_conv(psi_1,psi_2,psi_3)
+                dphi_x, dphi_y, dphi_z = calc_kinematic_conv(dpsi_1,dpsi_2,dpsi_3)
 
                 # Set x-y-z bot commands
                 # TODO [LAB-07 & LAB-08]: Choose how Tx,Ty,Tz are set
-                if (t_now < 3):
-                    Tx = 1  # Roll in x-direction for first 3 seconds
-                    Ty = 0
-                    Tz = 0
-                elif (t_now < 6):
-                    Tx = 0
-                    Ty = 1  # Roll in y-direction for next 3 seconds
-                    Tz = 0
-                elif (t_now < 9):
-                    Tx = 0
-                    Ty = 0 
-                    Tz = 1 # Roll in z-direction for next 3 seconds
-                else:
-                    Tx = 0
-                    Ty = 0
-                    Tz = 0
+
+                #floor mapping 
+                # Tx = -1 => +y direction
+                # Tx = 1 => -y direction
+                # Ty = 1 => -x direction
+                # Ty = -1 => +x direction
+
+                Tx = -js_R_y
+                Ty = js_R_x
+                Tz = -js_L_x
+
+                # if (t_now < 3):
+                #     Tx = 1  # Roll in x-direction for first 3 seconds
+                #     Ty = 0
+                #     Tz = 0
+                # elif (t_now < 6):
+                #     Tx = 0
+                #     Ty = 1  # Roll in y-direction for next 3 seconds
+                #     Tz = 0
+                # elif (t_now < 9):
+                #     Tx = 0
+                #     Ty = 0 
+                #     Tz = 1 # Roll in z-direction for next 3 seconds
+                # else:
+                #     Tx = 0
+                #     Ty = 0
+                #     Tz = 0
+
+                # # draw square on floor
+                # if (t_now < 2):
+                #     #roll +y
+                #     Tx = 0.5 
+                #     Ty = 0
+                #     Tz = 0
+                # elif (t_now < 4):
+                #     # roll -x
+                #     Tx = 0
+                #     Ty = -0.5
+                #     Tz = 0
+                # elif (t_now < 6):
+                #     # roll -y
+                #     Tx = -0.5
+                #     Ty = 0
+                #     Tz = 0
+                # elif (t_now < 8):
+                #     # roll +x
+                #     Tx = 0
+                #     Ty = 0.5
+                #     Tz = 0
+                # else:
+                #     Tx = 0
+                #     Ty = 0
+                #     Tz = 0
 
                 # Tx = js_R_y
                 # Ty = js_R_x
@@ -220,16 +260,28 @@ def main():
                 
                 # Store data in data logger
                 # TODO [IF DESIRED]: Update variables to match data header names for logging
-                data = [i, t_now, Tx, Ty, Tz, u1, u2, u3, theta_x, theta_y, theta_z, enc_pos_1, enc_pos_2, enc_pos_3, enc_dtick_1, enc_dtick_2, enc_dtick_3]
+                # data = [i, t_now, Tx, Ty, Tz, u1, u2, u3, theta_x, theta_y, theta_z, enc_pos_1, enc_pos_2, enc_pos_3, enc_dtick_1, enc_dtick_2, enc_dtick_3]
+                # dl.appendData(data)
+                # # Print out data in terminal
+                # # TODO: [IF DESIRED]: Update for what info you want to see in terminal (note: this is only printed data, not logged!)
+                # print(
+                #     f"Time: {t_now:.3f}s | Tx: {Tx:.2f}, Ty: {Ty:.2f}, Tz: {Tz:.2f} | "
+                #     f"u1: {u1:.2f}, u2: {u2:.2f}, u3: {u3:.2f} | "
+                #     f"Theta X: {theta_x:.2f}, Theta Y: {theta_y:.2f}, Theta Z: {theta_z:.2f} | "
+                #     f"Psi 1: {enc_pos_1:.1f}, Psi 2: {enc_pos_2:.1f}, Psi 3: {enc_pos_3:.1f} | "
+                #     f"dPsi 1: {enc_dtick_1:.2f}, dPsi 2: {enc_dtick_2:.2f}, dPsi 3: {enc_dtick_3:.2f} | "
+                # )
+
+                # For Lab 8 - on the floor
+                data = [t_now, Tx, Ty, Tz, u1, u2, u3, dpsi_1, dpsi_2, dpsi_3, phi_x, phi_y, phi_z, dphi_x, dphi_y, dphi_z]
                 dl.appendData(data)
                 # Print out data in terminal
-                # TODO: [IF DESIRED]: Update for what info you want to see in terminal (note: this is only printed data, not logged!)
                 print(
                     f"Time: {t_now:.3f}s | Tx: {Tx:.2f}, Ty: {Ty:.2f}, Tz: {Tz:.2f} | "
                     f"u1: {u1:.2f}, u2: {u2:.2f}, u3: {u3:.2f} | "
-                    f"Theta X: {theta_x:.2f}, Theta Y: {theta_y:.2f}, Theta Z: {theta_z:.2f} | "
-                    f"Psi 1: {enc_pos_1:.1f}, Psi 2: {enc_pos_2:.1f}, Psi 3: {enc_pos_3:.1f} | "
-                    f"dPsi 1: {enc_dtick_1:.2f}, dPsi 2: {enc_dtick_2:.2f}, dPsi 3: {enc_dtick_3:.2f} | "
+                    f"dPsi 1: {dpsi_1:.2f}, dPsi 2: {dpsi_2:.2f}, dPsi 3: {dpsi_3:.2f} | "
+                    f"Phi X: {phi_x:.2f}, Phi Y: {phi_y:.2f}, Phi Z: {phi_z:.2f} | "
+                    f"dPhi X: {dphi_x:.2f}, dPhi Y: {dphi_y:.2f}, dPhi Z: {dphi_z:.2f} | "
                 )
             
             except KeyError:
