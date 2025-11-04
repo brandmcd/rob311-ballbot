@@ -227,6 +227,7 @@ def main():
                 
                 # Store data in data logger
                 data = [t_now, Tz, phi_x, phi_y, phi_z, dphi_x, dphi_y, dphi_z, enc_pos_1, enc_pos_2, enc_pos_3, enc_dtick_1, enc_dtick_2, enc_dtick_3, theta_x, theta_y, theta_z]
+                dl.appendData(data)
                 # TODO [IF DESIRED]: Update variables to match data header names for logging
                 # 
                 # dl.appendData(data)
@@ -241,16 +242,16 @@ def main():
                 # )
 
                 # For Lab 8 - on the floor
-                data = [t_now, Tx, Ty, Tz, u1, u2, u3, dpsi_1, dpsi_2, dpsi_3, phi_x, phi_y, phi_z, dphi_x, dphi_y, dphi_z]
-                dl.appendData(data)
+                #data = [t_now, Tx, Ty, Tz, u1, u2, u3, dpsi_1, dpsi_2, dpsi_3, phi_x, phi_y, phi_z, dphi_x, dphi_y, dphi_z]
+                
                 # Print out data in terminal
-                print(
-                    f"Time: {t_now:.3f}s | Tx: {Tx:.2f}, Ty: {Ty:.2f}, Tz: {Tz:.2f} | "
-                    f"u1: {u1:.2f}, u2: {u2:.2f}, u3: {u3:.2f} | "
-                    f"dPsi 1: {dpsi_1:.2f}, dPsi 2: {dpsi_2:.2f}, dPsi 3: {dpsi_3:.2f} | "
-                    f"Phi X: {phi_x:.2f}, Phi Y: {phi_y:.2f}, Phi Z: {phi_z:.2f} | "
-                    f"dPhi X: {dphi_x:.2f}, dPhi Y: {dphi_y:.2f}, dPhi Z: {dphi_z:.2f} | "
-                )
+                #print(
+                #    f"Time: {t_now:.3f}s | Tx: {Tx:.2f}, Ty: {Ty:.2f}, Tz: {Tz:.2f} | "
+                #    f"u1: {u1:.2f}, u2: {u2:.2f}, u3: {u3:.2f} | "
+                #    f"dPsi 1: {dpsi_1:.2f}, dPsi 2: {dpsi_2:.2f}, dPsi 3: {dpsi_3:.2f} | "
+                #    f"Phi X: {phi_x:.2f}, Phi Y: {phi_y:.2f}, Phi Z: {phi_z:.2f} | "
+                #    f"dPhi X: {dphi_x:.2f}, dPhi Y: {dphi_y:.2f}, dPhi Z: {dphi_z:.2f} | "
+                #)
             
             except KeyError:
                 print("Waiting for sensor data...")
