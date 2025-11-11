@@ -1,0 +1,4 @@
+bluetoothctl
+connect D4:6C:48:E9:6A:36
+exit
+press on home and power buttons to pair

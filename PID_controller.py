@@ -16,7 +16,7 @@ PWM_MAX = 1.0               # absolute motor command bound
 # --- Controller tuning parameters ------------------------------------------
 PWM_USER_CAP = 0.50         # actuator saturation for tuning (±50%)
 SOFTSTART_SEC = 2.0         # seconds to ramp soft-start
-DEADBAND_TH_DEG = 0.25      # deadband on small angle errors (degrees)
+DEADBAND_TH_DEG = 0.3      # deadband on small angle errors (degrees)
 TH_ABORT_DEG = 18.0         # hard abort if tilt exceeds this (degrees)
 
 # --- Robot geometry --------------------------------------------------------
@@ -148,7 +148,7 @@ class PIDAxis:
         debug_dict contains diagnostic values used for logging/tuning.
         """
         # desired theta is zero
-        err = -theta_meas
+        err = theta_meas
         err = error_with_deadband(err, self.db_rad)
 
         # Integrator
@@ -249,6 +249,7 @@ def main():
     prev_L1 = 0
     prev_R1 = 0
     prev_tri = 0
+    prev_cir = 0
 
     command = mbot_motor_pwm_t()
 
@@ -343,8 +344,12 @@ def main():
                             pid_y.ki = max(0.0, pid_y.ki - step)
                         else:
                             pid_y.kd = max(0.0, pid_y.kd - step)
+                    print("\n")
+                    print("==============================================================================")
                     print(f"Tuned (dec) axis={'X' if selected_axis==0 else 'Y'} {['Kp','Ki','Kd'][selected_gain]} -> X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})")
-
+                    print("==============================================================================")
+                    print("\n")
+                    
                 # kill (triangle) - immediate stop
                 if tri and not prev_tri:
                     print("PS4 KILL (Triangle) pressed - stopping motors and exiting.")
@@ -355,11 +360,21 @@ def main():
                     lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
                     break
 
+                # reset IMU offsets on Circle button (edge detect)
+                cir = bt_signals.get("but_cir", 0)
+                if cir and not prev_cir:
+                    # set current IMU angles as new zero offsets
+                    theta_x_0 = msg.imu_angles_rpy[0]
+                    theta_y_0 = msg.imu_angles_rpy[1]
+                    theta_z_0 = msg.imu_angles_rpy[2]
+                    print(f"IMU reset (Circle): theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
+
                 prev_dpad_h = dpad_h
                 prev_dpad_v = dpad_v
                 prev_L1 = L1
                 prev_R1 = R1
                 prev_tri = tri
+                prev_cir = cir
 
             # read sensors
             theta_x = msg.imu_angles_rpy[0] - theta_x_0
@@ -482,7 +497,6 @@ def main():
         dl.writeOut()
 
         # stop listener thread
-        global listening
         listening = False
         print("Stopping LCM listener...")
         try:
