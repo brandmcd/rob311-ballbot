@@ -6,6 +6,7 @@ import numpy as np
 from mbot_lcm_msgs.mbot_motor_pwm_t import mbot_motor_pwm_t
 from mbot_lcm_msgs.mbot_balbot_feedback_t import mbot_balbot_feedback_t
 from DataLogger import dataLogger
+from ps4_controller_api import PS4InputHandler  # added: PS4 controller support
 
 # --- Control loop constants -------------------------------------------------
 FREQ = 200                  # Hz
@@ -207,6 +208,12 @@ def main():
     listener_thread.start()
     print("Started continuous LCM listener...")
 
+    # === PS4 controller setup (kill + manual tuning via dpad) ===
+    controller = PS4InputHandler(interface="/dev/input/js0", connecting_using_ds4drv=False)
+    controller_thread = threading.Thread(target=controller.listen, args=(10,), daemon=True)
+    controller_thread.start()
+    print("PS4 Controller is active for kill + tuning (use dpad + L1/R1).")
+
     # Wait briefly for a valid IMU message
     print("Waiting for IMU data...")
     t_wait = time.time()
@@ -233,6 +240,16 @@ def main():
     ma_dthx.reset(0.0)
     ma_dthy.reset(0.0)
 
+    # --- PS4 tuning state variables ---
+    selected_axis = 0  # 0 => X, 1 => Y
+    selected_gain = 0  # 0 => Kp, 1 => Ki, 2 => Kd
+    gain_steps = [0.1, 0.01, 0.01]  # step sizes for Kp, Ki, Kd
+    prev_dpad_h = 0.0
+    prev_dpad_v = 0.0
+    prev_L1 = 0
+    prev_R1 = 0
+    prev_tri = 0
+
     command = mbot_motor_pwm_t()
 
     header = [
@@ -252,6 +269,7 @@ def main():
 
     # --- Main control loop ------------------------------------------------
     print("Starting PID balance tuning loop...")
+    print("Controls: L1=select X axis, R1=select Y axis, dpad horiz=select gain (Kp/Ki/Kd), dpad vert=inc/dec gain, Triangle=KILL")
     time.sleep(0.3)
     t_start = time.time()
     prev_thx_f = 0.0
@@ -260,6 +278,88 @@ def main():
     try:
         while True:
             loop_t0 = time.time()
+
+            # read PS4 controller signals (non-blocking)
+            try:
+                bt_signals = controller.get_signals()
+            except Exception:
+                bt_signals = None
+
+            # handle tuning + kill inputs from PS4
+            if bt_signals is not None:
+                dpad_h = bt_signals.get("dpad_horiz", 0.0)
+                dpad_v = bt_signals.get("dpad_vert", 0.0)
+                L1 = bt_signals.get("shoulder_L1", 0)
+                R1 = bt_signals.get("shoulder_R1", 0)
+                tri = bt_signals.get("but_tri", 0)
+
+                # select axis
+                if L1 and not prev_L1:
+                    selected_axis = 0
+                    print("Selected axis: X")
+                if R1 and not prev_R1:
+                    selected_axis = 1
+                    print("Selected axis: Y")
+
+                # select gain index via dpad horizontal (edge detect)
+                if (dpad_h > 0.5) and (prev_dpad_h <= 0.5):
+                    selected_gain = (selected_gain + 1) % 3
+                    print(f"Selected gain index: {['Kp','Ki','Kd'][selected_gain]}")
+                if (dpad_h < -0.5) and (prev_dpad_h >= -0.5):
+                    selected_gain = (selected_gain - 1) % 3
+                    print(f"Selected gain index: {['Kp','Ki','Kd'][selected_gain]}")
+
+                # adjust gain via dpad vertical (edge detect)
+                if (dpad_v > 0.5) and (prev_dpad_v <= 0.5):
+                    step = gain_steps[selected_gain]
+                    if selected_axis == 0:
+                        if selected_gain == 0:
+                            pid_x.kp += step
+                        elif selected_gain == 1:
+                            pid_x.ki += step
+                        else:
+                            pid_x.kd += step
+                    else:
+                        if selected_gain == 0:
+                            pid_y.kp += step
+                        elif selected_gain == 1:
+                            pid_y.ki += step
+                        else:
+                            pid_y.kd += step
+                    print(f"Tuned (inc) axis={'X' if selected_axis==0 else 'Y'} {['Kp','Ki','Kd'][selected_gain]} -> X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})")
+                if (dpad_v < -0.5) and (prev_dpad_v >= -0.5):
+                    step = gain_steps[selected_gain]
+                    if selected_axis == 0:
+                        if selected_gain == 0:
+                            pid_x.kp = max(0.0, pid_x.kp - step)
+                        elif selected_gain == 1:
+                            pid_x.ki = max(0.0, pid_x.ki - step)
+                        else:
+                            pid_x.kd = max(0.0, pid_x.kd - step)
+                    else:
+                        if selected_gain == 0:
+                            pid_y.kp = max(0.0, pid_y.kp - step)
+                        elif selected_gain == 1:
+                            pid_y.ki = max(0.0, pid_y.ki - step)
+                        else:
+                            pid_y.kd = max(0.0, pid_y.kd - step)
+                    print(f"Tuned (dec) axis={'X' if selected_axis==0 else 'Y'} {['Kp','Ki','Kd'][selected_gain]} -> X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})")
+
+                # kill (triangle) - immediate stop
+                if tri and not prev_tri:
+                    print("PS4 KILL (Triangle) pressed - stopping motors and exiting.")
+                    # emergency stop publish zero PWM
+                    command = mbot_motor_pwm_t()
+                    command.utime = int(time.time() * 1e6)
+                    command.pwm[:] = [0.0, 0.0, 0.0]
+                    lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+                    break
+
+                prev_dpad_h = dpad_h
+                prev_dpad_v = dpad_v
+                prev_L1 = L1
+                prev_R1 = R1
+                prev_tri = tri
 
             # read sensors
             theta_x = msg.imu_angles_rpy[0] - theta_x_0
@@ -387,6 +487,13 @@ def main():
         print("Stopping LCM listener...")
         try:
             listener_thread.join(timeout=1)
+        except Exception:
+            pass
+
+        # stop PS4 controller thread gracefully
+        try:
+            controller.on_options_press()
+            controller_thread.join(timeout=1)
         except Exception:
             pass
 
