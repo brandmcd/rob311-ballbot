@@ -27,8 +27,8 @@ R_K = 0.121                 # ball radius [m]
 alpha = 45 * (np.pi / 180)  # omni-wheel angle from vertical [rad]
 
 # --- PID initial gains (tuning) -------------------------------------------
-Kp_x, Ki_x, Kd_x = 8.0, 0.0, 0.0
-Kp_y, Ki_y, Kd_y = 8.0, 0.0, 0.0
+Kp_x, Ki_x, Kd_x = 2.0, 0.0, 0.0
+Kp_y, Ki_y, Kd_y = 2.0, 0.0, 0.0
 
 # --- Filters ---------------------------------------------------------------
 MA_TH_WIN = 11              # samples for theta moving average
@@ -148,7 +148,7 @@ class PIDAxis:
         debug_dict contains diagnostic values used for logging/tuning.
         """
         # desired theta is zero
-        err = theta_meas
+        err = -theta_meas
         err = error_with_deadband(err, self.db_rad)
 
         # Integrator
@@ -241,15 +241,11 @@ def main():
     ma_dthy.reset(0.0)
 
     # --- PS4 tuning state variables ---
-    selected_axis = 0  # 0 => X, 1 => Y
-    selected_gain = 0  # 0 => Kp, 1 => Ki, 2 => Kd
-    gain_steps = [0.1, 0.01, 0.01]  # step sizes for Kp, Ki, Kd
+    step = 0.1
     prev_dpad_h = 0.0
     prev_dpad_v = 0.0
     prev_L1 = 0
     prev_R1 = 0
-    prev_tri = 0
-    prev_cir = 0
 
     command = mbot_motor_pwm_t()
 
@@ -294,62 +290,17 @@ def main():
                 R1 = bt_signals.get("shoulder_R1", 0)
                 tri = bt_signals.get("but_tri", 0)
 
-                # select axis
-                if L1 and not prev_L1:
-                    selected_axis = 0
-                    print("Selected axis: X")
-                if R1 and not prev_R1:
-                    selected_axis = 1
-                    print("Selected axis: Y")
-
-                # select gain index via dpad horizontal (edge detect)
-                if (dpad_h > 0.5) and (prev_dpad_h <= 0.5):
-                    selected_gain = (selected_gain + 1) % 3
-                    print(f"Selected gain index: {['Kp','Ki','Kd'][selected_gain]}")
-                if (dpad_h < -0.5) and (prev_dpad_h >= -0.5):
-                    selected_gain = (selected_gain - 1) % 3
-                    print(f"Selected gain index: {['Kp','Ki','Kd'][selected_gain]}")
-
-                # adjust gain via dpad vertical (edge detect)
-                if (dpad_v > 0.5) and (prev_dpad_v <= 0.5):
-                    step = gain_steps[selected_gain]
-                    if selected_axis == 0:
-                        if selected_gain == 0:
-                            pid_x.kp += step
-                        elif selected_gain == 1:
-                            pid_x.ki += step
-                        else:
-                            pid_x.kd += step
-                    else:
-                        if selected_gain == 0:
-                            pid_y.kp += step
-                        elif selected_gain == 1:
-                            pid_y.ki += step
-                        else:
-                            pid_y.kd += step
-                    print(f"Tuned (inc) axis={'X' if selected_axis==0 else 'Y'} {['Kp','Ki','Kd'][selected_gain]} -> X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})")
-                if (dpad_v < -0.5) and (prev_dpad_v >= -0.5):
-                    step = gain_steps[selected_gain]
-                    if selected_axis == 0:
-                        if selected_gain == 0:
-                            pid_x.kp = max(0.0, pid_x.kp - step)
-                        elif selected_gain == 1:
-                            pid_x.ki = max(0.0, pid_x.ki - step)
-                        else:
-                            pid_x.kd = max(0.0, pid_x.kd - step)
-                    else:
-                        if selected_gain == 0:
-                            pid_y.kp = max(0.0, pid_y.kp - step)
-                        elif selected_gain == 1:
-                            pid_y.ki = max(0.0, pid_y.ki - step)
-                        else:
-                            pid_y.kd = max(0.0, pid_y.kd - step)
-                    print("\n")
-                    print("==============================================================================")
-                    print(f"Tuned (dec) axis={'X' if selected_axis==0 else 'Y'} {['Kp','Ki','Kd'][selected_gain]} -> X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})")
-                    print("==============================================================================")
-                    print("\n")
+                # select p gain with dpad
+                if dpad_h > prev_dpad_h:
+                    pid_x.kp += step
+                    pid_y.kp += step
+                    print(f"Increased Kp -> X: {pid_x.kp:.3f}, Y: {pid_y.kp:.3f}")
+                elif dpad_h < prev_dpad_h:
+                    pid_x.kp -= step
+                    pid_y.kp -= step
+                    print(f"Decreased Kp -> X: {pid_x.kp:.3f}, Y: {pid_y.kp:.3f}")
                     
+                
                 # kill (triangle) - immediate stop
                 if tri and not prev_tri:
                     print("PS4 KILL (Triangle) pressed - stopping motors and exiting.")
@@ -472,7 +423,12 @@ def main():
             print(
                 f"t={t_now:5.2f}s | θ(deg)=({np.rad2deg(thx_f):+5.2f},{np.rad2deg(thy_f):+5.2f}) "
                 f"| Tx/Ty=({Tx:+.3f},{Ty:+.3f}) | u=({u1:+.3f},{u2:+.3f},{u3:+.3f}) | cap={pwm_cap:.2f} | abort={abort}"
+                f"(X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})"
             )
+
+            #print PID debug
+            print(f"PID X Debug: {dbgx}")
+            print(f"PID Y Debug: {dbgy}")
 
             # rate control
             loop_dt = time.time() - loop_t0

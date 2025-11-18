@@ -125,19 +125,15 @@ class PS4InputHandler(Controller):
     # TODO: update code for D-Pad Buttons to increase/decrease value when pressed (not to toggle 0 or 1)
     # Hint: you may not need the release functions (that will reset your values...)
     def on_left_arrow_press(self):
-        if self.signals["dpad_horiz"] > -0.9:
             self.signals["dpad_horiz"] -= 0.1
     def on_right_arrow_press(self):
-        if self.signals["dpad_horiz"] < 0.9:
             self.signals["dpad_horiz"] += 0.1
     # def on_left_right_arrow_release(self):
     #     self.signals["dir_L"] = 0
     #     self.signals["dir_R"] = 0
     def on_up_arrow_press(self):
-        if self.signals["dpad_vert"] < 0.9:
             self.signals["dpad_vert"] += 0.1
     def on_down_arrow_press(self):
-        if self.signals["dpad_vert"] > -0.9:
             self.signals["dpad_vert"] -= 0.1
     # def on_up_down_arrow_release(self):
     #     self.signals["dir_U"] = 0
