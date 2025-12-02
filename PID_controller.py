@@ -1,64 +1,62 @@
 import time
-import threading
 import lcm
+import threading
 import numpy as np
-
 from mbot_lcm_msgs.mbot_motor_pwm_t import mbot_motor_pwm_t
 from mbot_lcm_msgs.mbot_balbot_feedback_t import mbot_balbot_feedback_t
-from DataLogger import dataLogger
-from ps4_controller_api import PS4InputHandler  # added: PS4 controller support
+from DataLogger3 import dataLogger
+from ps4_controller_api import PS4InputHandler
 
-# --- Control loop constants -------------------------------------------------
-FREQ = 200                  # Hz
-DT = 1.0 / FREQ             # s per step
-PWM_MAX = 1.0               # absolute motor command bound
+# ===== helpers =====
+from pid import PID
 
-# --- Controller tuning parameters ------------------------------------------
-PWM_USER_CAP = 0.50         # actuator saturation for tuning (±50%)
-SOFTSTART_SEC = 2.0         # seconds to ramp soft-start
-DEADBAND_TH_DEG = 0.3      # deadband on small angle errors (degrees)
-TH_ABORT_DEG = 18.0         # hard abort if tilt exceeds this (degrees)
+# Constants for the control loop
+FREQ = 200  # Frequency of control loop [Hz]
+DT = 1 / FREQ  # Time step for each iteration [sec]
+PWM_MAX = 0.96
+N_GEARBOX = 70
+N_ENC = 64
+R_W = 0.048
+R_K = 0.121
+alpha = 45*(np.pi/180)
 
-# --- Robot geometry --------------------------------------------------------
-N_GEARBOX = 70              # gearbox ratio
-N_ENC = 64                  # encoder ticks per motor rev
-R_W = 0.048                 # omni-wheel radius [m]
-R_K = 0.121                 # ball radius [m]
-alpha = 45 * (np.pi / 180)  # omni-wheel angle from vertical [rad]
+# Steering/balance coordination
+THETA_MAX_DEG = 6.0
+THETA_MAX_RAD = np.deg2rad(THETA_MAX_DEG)
+VEL_ACC_GAIN = 0.5   # a_des = VEL_ACC_GAIN * (v_des - v_meas)
+VEL_FILT_ALPHA = 0.25  # EMA for measured ball velocities dPhi
 
-# --- PID initial gains (tuning) -------------------------------------------
-Kp_x, Ki_x, Kd_x = 2.0, 0.0, 0.0
-Kp_y, Ki_y, Kd_y = 2.0, 0.0, 0.0
+# Steering safety: above this lean, ignore velocity commands & just balance
+TH_STEER_PRIOR_DEG = 8.0
+TH_STEER_PRIOR_RAD = np.deg2rad(TH_STEER_PRIOR_DEG)
+VEL_CMD_EPS = 1e-3
 
-# --- Filters ---------------------------------------------------------------
-MA_TH_WIN = 11              # samples for theta moving average
-MA_DTH_WIN = 7              # samples for dtheta moving average
 
-# --- LCM / runtime globals ------------------------------------------------
+# Set to True to enable balance mode (PID control on lean angles)
+BALANCE_MODE = True
+
+# Safety parameters
+TH_ABORT_DEG = 25.0         # hard abort if tilt exceeds this (degrees)
+PWM_USER_CAP = 0.96         # actuator saturation during balancing
+
+# Global flags to control the listening thread & msg data
 listening = False
 msg = mbot_balbot_feedback_t()
-last_time = 0.0
-last_seen = {"MBOT_BALBOT_FEEDBACK": 0.0}
-
+last_time = 0
+last_seen = {"MBOT_BALBOT_FEEDBACK": 0}
 
 def feedback_handler(channel, data):
-    """LCM callback to decode incoming feedback messages."""
     global msg, last_seen, last_time
     last_time = time.time()
-    last_seen[channel] = last_time
+    last_seen[channel] = time.time()
     msg = mbot_balbot_feedback_t.decode(data)
 
 
 def lcm_listener(lc):
-    """Background thread: handle LCM with a timeout and print warnings.
-
-    This mirrors the behavior in `ballbot_control.py` so users see similar
-    console diagnostics when the LCM publisher is inactive.
-    """
     global listening
     while listening:
         try:
-            lc.handle_timeout(100)  # 100 ms
+            lc.handle_timeout(100)
             if time.time() - last_time > 2.0:
                 print("LCM Publisher seems inactive...")
             elif time.time() - last_seen["MBOT_BALBOT_FEEDBACK"] > 2.0:
@@ -68,123 +66,28 @@ def lcm_listener(lc):
             break
 
 
-# ------------------------- Helper functions ---------------------------------
 def calc_enc2rad(ticks):
-    """Convert encoder ticks (absolute) to motor shaft radians."""
-    return (2.0 * np.pi * ticks) / (N_ENC * N_GEARBOX)
+    return (2*np.pi*ticks)/(N_ENC*N_GEARBOX)
 
 
-def calc_torque_conv(Tx, Ty, Tz):
-    """Convert virtual torques (Tx,Ty,Tz) to individual motor torques u1,u2,u3."""
-    u1 = (1.0 / 3.0) * (Tz - ((2.0 * Ty) / np.cos(alpha)))
-    u2 = (1.0 / 3.0) * (Tz + (1.0 / np.cos(alpha)) * (-np.sqrt(3) * Tx + Ty))
-    u3 = (1.0 / 3.0) * (Tz + (1.0 / np.cos(alpha)) * ( np.sqrt(3) * Tx + Ty))
+def calc_torque_conv(Tx,Ty,Tz):
+    u1 = (1/3)*(Tz- ((2*Ty)/np.cos(alpha)))
+    u2 = (1/3)*(Tz + (1/np.cos(alpha))*(-np.sqrt(3)*Tx + Ty))
+    u3 = (1/3)*(Tz + (1/np.cos(alpha))*(np.sqrt(3)*Tx + Ty))
     return u1, u2, u3
 
 
-def calc_kinematic_conv(psi1, psi2, psi3):
-    """Motor angles -> ball rotation angles (phi_x, phi_y, phi_z)."""
-    phi_x = (np.sqrt(2.0 / 3.0)) * (R_W / R_K) * (psi2 - psi3)
-    phi_y = (np.sqrt(2.0) / 3.0) * (R_W / R_K) * (-2.0 * psi1 + psi2 + psi3)
-    phi_z = (np.sqrt(2.0) / 3.0) * (R_W / R_K) * (psi1 + psi2 + psi3)
+def calc_kinematic_conv(psi1,psi2,psi3):
+    phi_x = (np.sqrt(2/3))*(R_W/R_K)*(psi2 - psi3)
+    phi_y = (np.sqrt(2)/3)*(R_W/R_K)*(-2*psi1 + psi2 + psi3)
+    phi_z = (np.sqrt(2)/3)*(R_W/R_K)*(psi1 + psi2 + psi3)
     return phi_x, phi_y, phi_z
 
 
-def func_clip(x, lo, hi):
-    """Clip x to the inclusive range [lo, hi]."""
-    return max(lo, min(hi, x))
-
-
-class MovingAverage:
-    """Simple fixed-window moving average with O(1) update."""
-
-    def __init__(self, win):
-        self.win = max(1, int(win))
-        self.buf = np.zeros(self.win, dtype=float)
-        self.sum = 0.0
-        self.idx = 0
-        self.count = 0
-
-    def reset(self, x0=0.0):
-        self.buf[:] = x0
-        self.sum = float(x0) * self.win
-        self.idx = 0
-        self.count = self.win
-
-    def step(self, x):
-        old = self.buf[self.idx]
-        self.sum -= old
-        self.buf[self.idx] = x
-        self.sum += x
-        self.idx = (self.idx + 1) % self.win
-        if self.count < self.win:
-            self.count += 1
-        return self.sum / self.count
-
-
-def error_with_deadband(err, db_rad):
-    return 0.0 if abs(err) < db_rad else err
-
-
-class PIDAxis:
-    """PID controller for a single tilt axis. D-term uses measured dtheta."""
-
-    def __init__(self, kp=0.0, ki=0.0, kd=0.0, out_min=-1.0, out_max=1.0, db_rad=0.0):
-        self.kp = kp
-        self.ki = ki
-        self.kd = kd
-        self.out_min = out_min
-        self.out_max = out_max
-        self.db_rad = db_rad
-        self.iaccum = 0.0
-
-    def reset(self):
-        self.iaccum = 0.0
-
-    def step(self, theta_meas, dtheta_meas):
-        """Compute one PID step.
-
-        Returns (u_sat, debug_dict) where u_sat is the saturated output and
-        debug_dict contains diagnostic values used for logging/tuning.
-        """
-        # desired theta is zero
-        err = -theta_meas
-        err = error_with_deadband(err, self.db_rad)
-
-        # Integrator
-        self.iaccum += err * DT
-
-        # PID (D on measurement)
-        uP = self.kp * err
-        uI = self.ki * self.iaccum
-        uD = -self.kd * dtheta_meas
-        u = uP + uI + uD
-
-        # Saturate and apply a simple anti-windup: if saturation happens and
-        # integrator would push further into saturation, undo last integration.
-        u_sat = func_clip(u, self.out_min, self.out_max)
-        if (u != u_sat) and ((u_sat > 0 and err > 0) or (u_sat < 0 and err < 0)):
-            self.iaccum -= err * DT
-            uI = self.ki * self.iaccum
-            u = uP + uI + uD
-            u_sat = func_clip(u, self.out_min, self.out_max)
-
-        debug = {
-            'err': err,
-            'uP': uP,
-            'uI': uI,
-            'uD': uD,
-            'iaccum': self.iaccum,
-            'u_unsat': u,
-            'u_sat': u_sat,
-        }
-        return u_sat, debug
-
-
-def soft_pwm_cap(start_time):
-    t = time.time() - start_time
-    ramp = np.clip(t / SOFTSTART_SEC, 0.2, 1.0)
-    return min(PWM_USER_CAP, ramp * PWM_MAX)
+def func_clip(x,lim_lo,lim_hi):
+    if x > lim_hi: x = lim_hi
+    elif x < lim_lo: x = lim_lo
+    return x
 
 
 def too_lean(theta_x, theta_y, deg_limit):
@@ -192,15 +95,14 @@ def too_lean(theta_x, theta_y, deg_limit):
     return (abs(theta_x) > np.deg2rad(deg_limit)) or (abs(theta_y) > np.deg2rad(deg_limit))
 
 
-# ------------------------------ Main ---------------------------------------
 def main():
-    # --- Data logger setup -------------------------------------------------
+    # === Data Logging Initialization ===
     trial_num = int(input("Test Number? "))
-    filename = f"ballbot_pid_tuning_{trial_num}.txt"
+    filename = f"main_control_{trial_num}.txt"
     dl = dataLogger(filename)
 
-    # --- LCM setup --------------------------------------------------------
-    global listening, msg
+    # === LCM Messaging Initialization ===
+    global listening, msg, BALANCE_MODE
     lc = lcm.LCM("udpm://239.255.76.67:7667?ttl=0")
     subscription = lc.subscribe("MBOT_BALBOT_FEEDBACK", feedback_handler)
     listening = True
@@ -208,239 +110,403 @@ def main():
     listener_thread.start()
     print("Started continuous LCM listener...")
 
-    # === PS4 controller setup (kill + manual tuning via dpad) ===
-    controller = PS4InputHandler(interface="/dev/input/js0", connecting_using_ds4drv=False)
-    controller_thread = threading.Thread(target=controller.listen, args=(10,), daemon=True)
+    # === Controller Initialization ===
+    controller = PS4InputHandler(interface="/dev/input/js0",connecting_using_ds4drv=False)
+    controller_thread = threading.Thread(target=controller.listen, args=(10,))
+    controller_thread.daemon = True
     controller_thread.start()
-    print("PS4 Controller is active for kill + tuning (use dpad + L1/R1).")
+    print("PS4 Controller is active...")
+    print("Controls: Triangle=KILL, Circle=Reset IMU, L/R sticks=manual control (when BALANCE_MODE=False)")
 
-    # Wait briefly for a valid IMU message
-    print("Waiting for IMU data...")
-    t_wait = time.time()
-    while (msg.utime == 0) and (time.time() - t_wait < 3.0):
-        lc.handle_timeout(50)
-        time.sleep(0.01)
-
-    # --- Controller initialization ----------------------------------------
-    theta_x_0 = msg.imu_angles_rpy[0]
-    theta_y_0 = msg.imu_angles_rpy[1]
-    theta_z_0 = msg.imu_angles_rpy[2]
-    print(f"Offsets set: theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
-
-    db_rad = np.deg2rad(DEADBAND_TH_DEG)
-    pid_x = PIDAxis(Kp_x, Ki_x, Kd_x, out_min=-1.0, out_max=1.0, db_rad=db_rad)
-    pid_y = PIDAxis(Kp_y, Ki_y, Kd_y, out_min=-1.0, out_max=1.0, db_rad=db_rad)
-
-    ma_thx = MovingAverage(MA_TH_WIN)
-    ma_thy = MovingAverage(MA_TH_WIN)
-    ma_dthx = MovingAverage(MA_DTH_WIN)
-    ma_dthy = MovingAverage(MA_DTH_WIN)
-    ma_thx.reset(0.0)
-    ma_thy.reset(0.0)
-    ma_dthx.reset(0.0)
-    ma_dthy.reset(0.0)
-
-    # --- PS4 tuning state variables ---
-    step = 0.1
-    prev_dpad_h = 0.0
-    prev_dpad_v = 0.0
-    prev_L1 = 0
-    prev_R1 = 0
-
-    command = mbot_motor_pwm_t()
-
-    header = [
-        "t",
-        "theta_x", "theta_y", "theta_z",
-        "theta_x_f", "theta_y_f", "dtheta_x_f", "dtheta_y_f",
-        "enc_pos_1", "enc_pos_2", "enc_pos_3",
-        "dpsi_1", "dpsi_2", "dpsi_3",
-        "phi_x", "phi_y", "phi_z",
-        "dphi_x", "dphi_y", "dphi_z",
-        "err_x", "err_y",
-        "Tx", "Ty", "Tz", "u1", "u2", "u3",
-        "Kp_x", "Ki_x", "Kd_x", "Kp_y", "Ki_y", "Kd_y",
-        "pwm_cap", "abort",
-    ]
-    dl.appendData([" ".join(header)])
-
-    # --- Main control loop ------------------------------------------------
-    print("Starting PID balance tuning loop...")
-    print("Controls: L1=select X axis, R1=select Y axis, dpad horiz=select gain (Kp/Ki/Kd), dpad vert=inc/dec gain, Triangle=KILL")
-    time.sleep(0.3)
-    t_start = time.time()
-    prev_thx_f = 0.0
-    prev_thy_f = 0.0
+    pid_x = PID(kp=8.6, ki=0, kd=0.02, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
+    pid_y = PID(kp=8.6, ki=0, kd=0.02, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
+    pid_x_steer = PID(kp=1, ki=0, kd=0, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
+    pid_y_steer = PID(kp=1, ki=0, kd=0, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
 
     try:
+        command = mbot_motor_pwm_t()
+        print("Starting steering control loop...")
+        time.sleep(0.5)
+        # Logging header focused on PID tuning: errors, individual PID contributions, PID gains, PID outputs
+                # Logging header compatible with DataLogger3_viewer
+        header = [
+            "i",
+            "t_now",
+            "Tx",
+            "Ty",
+            "Tz",
+            "u1",
+            "u2",
+            "u3",
+            "theta_x",
+            "theta_y",
+            "theta_z",
+            "psi_1",
+            "psi_2",
+            "psi_3",
+            "dpsi_1",
+            "dpsi_2",
+            "dpsi_3",
+            # extra stuff you still want:
+            "e_x",
+            "e_y",
+            "abort",
+            "kp_x",
+            "ki_x",
+            "kd_x",
+            "kp_y",
+            "ki_y",
+            "kd_y",
+        ]
+        dl.appendData(header)
+
+        i = 0
+        t_start = time.time()
+        t_now = 0
+        enc_pos_1_start = msg.enc_ticks[0]
+        enc_pos_2_start = msg.enc_ticks[1]
+        enc_pos_3_start = msg.enc_ticks[2]
+        u1 = u2 = u3 = 0
+        # zero angles on first sample per lab note
+        theta_x_0 = msg.imu_angles_rpy[0]
+        theta_y_0 = msg.imu_angles_rpy[1]
+        theta_z_0 = msg.imu_angles_rpy[2]
+        print(f"IMU offsets set: theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
+        prev_t = time.time()
+        # filtered ball velocity states
+        vx_filt = 0.0
+        vy_filt = 0.0
+        
+        # PS4 button state tracking for edge detection
+        prev_tri = 0
+        prev_cir = 0
+        prev_x = 0
+        
+        # D-pad tuning variables
+        step = 0.1
+        cur_tune = 0  # 0 for Kp, 1 for Kd, 2 for Ki
+        prev_dpad_h = 0
+        prev_dpad_vert = 0
+
         while True:
-            loop_t0 = time.time()
+            time.sleep(DT)
+            t_now = time.time() - t_start
+            i += 1
 
-            # read PS4 controller signals (non-blocking)
             try:
+                # gamepad
                 bt_signals = controller.get_signals()
-            except Exception:
-                bt_signals = None
-
-            # handle tuning + kill inputs from PS4
-            if bt_signals is not None:
-                dpad_h = bt_signals.get("dpad_horiz", 0.0)
-                dpad_v = bt_signals.get("dpad_vert", 0.0)
-                L1 = bt_signals.get("shoulder_L1", 0)
-                R1 = bt_signals.get("shoulder_R1", 0)
-                tri = bt_signals.get("but_tri", 0)
-
-                # select p gain with dpad
+                js_R_x = bt_signals["js_R_x"]
+                js_R_y = bt_signals["js_R_y"]
+                js_L_x = bt_signals["js_L_x"]
+                js_L_y = bt_signals["js_L_y"]
+                trigger_L2 = bt_signals["trigger_L2"]
+                trigger_R2 = bt_signals["trigger_R2"]
+                
+                # D-pad tuning
+                dpad_h = bt_signals["dpad_horiz"]
+                dpad_vert = bt_signals["dpad_vert"]
+                
+                # select gain to tune with dpad horizontal (left/right switches which gain)
                 if dpad_h > prev_dpad_h:
-                    pid_x.kp += step
-                    pid_y.kp += step
-                    print(f"Increased Kp -> X: {pid_x.kp:.3f}, Y: {pid_y.kp:.3f}")
+                    cur_tune = (cur_tune + 1) % 3
                 elif dpad_h < prev_dpad_h:
-                    pid_x.kp -= step
-                    pid_y.kp -= step
-                    print(f"Decreased Kp -> X: {pid_x.kp:.3f}, Y: {pid_y.kp:.3f}")
+                    cur_tune = (cur_tune - 1) % 3
+                
+                #tune for balance mode
+                if BALANCE_MODE:
+                    # adjust selected gain with dpad vertical (up increases, down decreases)
+                    if dpad_vert > prev_dpad_vert:
+                        if cur_tune == 0:
+                            pid_x.kp += step
+                            pid_y.kp += step
+                        elif cur_tune == 1:
+                            pid_x.kd += step/10
+                            pid_y.kd += step/10
+                        else:
+                            pid_x.ki += step/10
+                            pid_y.ki += step/10
+                    elif dpad_vert < prev_dpad_vert:
+                        if cur_tune == 0:
+                            pid_x.kp -= step
+                            pid_y.kp -= step
+                        elif cur_tune == 1:
+                            pid_x.kd -= step/10
+                            pid_y.kd -= step/10
+                        else:
+                            pid_x.ki -= step/10
+                            pid_y.ki -= step/10
+                #tune for steering
+                else:
+                    # adjust selected gain with dpad vertical (up increases, down decreases)
+                    if dpad_vert > prev_dpad_vert:
+                        if cur_tune == 0:
+                            pid_x_steer.kp += step
+                            pid_y_steer.kp += step
+                        elif cur_tune == 1:
+                            pid_x_steer.kd += step/10
+                            pid_y_steer.kd += step/10
+                        else:
+                            pid_x_steer.ki += step/10
+                            pid_y_steer.ki += step/10
+                    elif dpad_vert < prev_dpad_vert:
+                        if cur_tune == 0:
+                            pid_x_steer.kp -= step
+                            pid_y_steer.kp -= step
+                        elif cur_tune == 1:
+                            pid_x_steer.kd -= step/10
+                            pid_y_steer.kd -= step/10
+                        else:
+                            pid_x_steer.ki -= step/10
+                            pid_y_steer.ki -= step/10
+                    
                     
                 
-                # kill (triangle) - immediate stop
+                prev_dpad_h = dpad_h 
+                prev_dpad_vert = dpad_vert
+                # Safety buttons - Triangle kill, Circle IMU reset, and X to toggle balance/manual
+                tri = bt_signals.get("but_tri", 0)
+                cir = bt_signals.get("but_cir", 0)
+                sqr = bt_signals.get("but_sqr", 0)
+                but_x = bt_signals.get("but_x", 0)
+                
+                # Triangle kill (immediate stop)
                 if tri and not prev_tri:
                     print("PS4 KILL (Triangle) pressed - stopping motors and exiting.")
-                    # emergency stop publish zero PWM
                     command = mbot_motor_pwm_t()
                     command.utime = int(time.time() * 1e6)
                     command.pwm[:] = [0.0, 0.0, 0.0]
                     lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
                     break
-
-                # reset IMU offsets on Circle button (edge detect)
-                cir = bt_signals.get("but_cir", 0)
+                
+                # Circle IMU reset
                 if cir and not prev_cir:
-                    # set current IMU angles as new zero offsets
                     theta_x_0 = msg.imu_angles_rpy[0]
                     theta_y_0 = msg.imu_angles_rpy[1]
                     theta_z_0 = msg.imu_angles_rpy[2]
+                    pid_x.reset()
+                    pid_y.reset()
+                    pid_x_steer.reset()
+                    pid_y_steer.reset()
                     print(f"IMU reset (Circle): theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
+                
+                # X button toggles between balance and manual modes on press-edge
+                if but_x and not prev_x:
+                    BALANCE_MODE = not BALANCE_MODE
+                    mode_str = "BALANCE" if BALANCE_MODE else "MANUAL"
+                    print(f"Mode toggled (X): {mode_str}")
 
-                prev_dpad_h = dpad_h
-                prev_dpad_v = dpad_v
-                prev_L1 = L1
-                prev_R1 = R1
                 prev_tri = tri
                 prev_cir = cir
+                prev_x = but_x
 
-            # read sensors
-            theta_x = msg.imu_angles_rpy[0] - theta_x_0
-            theta_y = msg.imu_angles_rpy[1] - theta_y_0
-            theta_z = msg.imu_angles_rpy[2] - theta_z_0
+                # sensors
+                theta_x = msg.imu_angles_rpy[0] - theta_x_0
+                theta_y = msg.imu_angles_rpy[1] - theta_y_0
+                theta_z = msg.imu_angles_rpy[2] - theta_z_0
+                enc_pos_1 = msg.enc_ticks[0] - enc_pos_1_start
+                enc_pos_2 = msg.enc_ticks[1] - enc_pos_2_start
+                enc_pos_3 = msg.enc_ticks[2] - enc_pos_3_start
+                enc_dtick_1 = msg.enc_delta_ticks[0]
+                enc_dtick_2 = msg.enc_delta_ticks[1]
+                enc_dtick_3 = msg.enc_delta_ticks[2]
+                enc_dt = msg.enc_delta_time
 
-            # filtering
-            thx_f = ma_thx.step(theta_x)
-            thy_f = ma_thy.step(theta_y)
+                # wheel kinematics
+                psi_1 = calc_enc2rad(enc_pos_1)
+                psi_2 = calc_enc2rad(enc_pos_2)
+                psi_3 = calc_enc2rad(enc_pos_3)
+                # avoid div by zero
+                enc_dt = max(enc_dt, 1e-6)
+                dpsi_1 = calc_enc2rad(enc_dtick_1)/(enc_dt*1e-6)
+                dpsi_2 = calc_enc2rad(enc_dtick_2)/(enc_dt*1e-6)
+                dpsi_3 = calc_enc2rad(enc_dtick_3)/(enc_dt*1e-6)
+                phi_x, phi_y, phi_z = calc_kinematic_conv(psi_1,psi_2,psi_3)
+                dphi_x, dphi_y, dphi_z = calc_kinematic_conv(dpsi_1,dpsi_2,dpsi_3)
 
-            # derivatives (finite diff) + MA
-            dthx = (thx_f - prev_thx_f) / DT
-            dthy = (thy_f - prev_thy_f) / DT
-            prev_thx_f = thx_f
-            prev_thy_f = thy_f
-            dthx_f = ma_dthx.step(dthx)
-            dthy_f = ma_dthy.step(dthy)
+                # filter measured ball velocities for steering 
+                vx_filt = (1.0 - VEL_FILT_ALPHA) * vx_filt + VEL_FILT_ALPHA * dphi_x
+                vy_filt = (1.0 - VEL_FILT_ALPHA) * vy_filt + VEL_FILT_ALPHA * dphi_y
 
-            # read encoder positions & delta ticks
-            enc_pos_1 = msg.enc_ticks[0]
-            enc_pos_2 = msg.enc_ticks[1]
-            enc_pos_3 = msg.enc_ticks[2]
-            enc_dtick_1 = msg.enc_delta_ticks[0]
-            enc_dtick_2 = msg.enc_delta_ticks[1]
-            enc_dtick_3 = msg.enc_delta_ticks[2]
-            enc_dt = msg.enc_delta_time  # microseconds
+                # Safety check - abort if too lean
+                abort = too_lean(theta_x, theta_y, TH_ABORT_DEG)
+                    
+                now_t = time.time()
+                dt = max(1e-6, now_t - prev_t)
+                prev_t = now_t
 
-            # motor angles and speeds
-            psi_1 = calc_enc2rad(enc_pos_1)
-            psi_2 = calc_enc2rad(enc_pos_2)
-            psi_3 = calc_enc2rad(enc_pos_3)
-            if enc_dt > 0:
-                dpsi_1 = calc_enc2rad(enc_dtick_1) / (enc_dt * 1e-6)
-                dpsi_2 = calc_enc2rad(enc_dtick_2) / (enc_dt * 1e-6)
-                dpsi_3 = calc_enc2rad(enc_dtick_3) / (enc_dt * 1e-6)
-            else:
-                dpsi_1 = dpsi_2 = dpsi_3 = 0.0
+                # ====================================================================
+                # STEP 2A: JOYSTICK -> DESIRED VELOCITIES
+                # ====================================================================
+                VEL_SCALE = 0.05   # rad/s per full-stick (gentler steering)
+                DEADZONE  = 0.08
 
-            # ball kinematics
-            phi_x, phi_y, phi_z = calc_kinematic_conv(psi_1, psi_2, psi_3)
-            dphi_x, dphi_y, dphi_z = calc_kinematic_conv(dpsi_1, dpsi_2, dpsi_3)
+                js_fwd   = -js_R_y if abs(js_R_y) > DEADZONE else 0.0   # forward/back
+                js_strafe = js_R_x if abs(js_R_x) > DEADZONE else 0.0   # left/right
 
-            # safety
-            abort = 1 if too_lean(thx_f, thy_f, TH_ABORT_DEG) else 0
+                vx_desired = VEL_SCALE * js_fwd      # forward velocity command (+x)
+                vy_desired = VEL_SCALE * js_strafe   # lateral velocity command (+y)
 
-            # PID compute
-            if abort:
-                Tx = 0.0
-                Ty = 0.0
-                pid_x.reset()
-                pid_y.reset()
-            else:
-                Tx, dbgx = pid_x.step(thx_f, dthx_f)
-                Ty, dbgy = pid_y.step(thy_f, dthy_f)
+                # Measured velocities (filtered) from ball kinematics
+                vx_meas = vx_filt
+                vy_meas = vy_filt
 
-            Tz = 0.0
+                # ====================================================================
+                # STEP 2B: VELOCITY -> DESIRED LEAN ANGLES
+                # ====================================================================
+                # Default: pure balance (upright)
+                theta_d_x = 0.0  # desired roll (for vy)
+                theta_d_y = 0.0  # desired pitch (for vx)
 
-            # allocate to wheels and apply soft cap
-            u1, u2, u3 = calc_torque_conv(Tx, Ty, Tz)
-            pwm_cap = soft_pwm_cap(t_start)
-            u1 = func_clip(u1, -pwm_cap, pwm_cap)
-            u2 = func_clip(u2, -pwm_cap, pwm_cap)
-            u3 = func_clip(u3, -pwm_cap, pwm_cap)
+                if BALANCE_MODE:
+                    # BALANCE-ONLY: always target upright
+                    pass
+                else:
+                    # STEERING MODE: use velocity errors to command lean angles,
+                    # but only if we're not already leaned too far and we actually
+                    # have a non-zero velocity command.
 
-            # publish PWM
-            cmd_utime = int(time.time() * 1e6)
-            command.utime = cmd_utime
-            command.pwm[0] = u1
-            command.pwm[1] = u2
-            command.pwm[2] = u3
-            lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+                    # If actual lean is too large, prioritize re-centering
+                    if (abs(theta_x) < TH_STEER_PRIOR_RAD) and (abs(theta_y) < TH_STEER_PRIOR_RAD):
+                        # Check if any velocity is commanded
+                        if (abs(vx_desired) > VEL_CMD_EPS) or (abs(vy_desired) > VEL_CMD_EPS):
+                            error_vx = vx_desired - vx_meas
+                            error_vy = vy_desired - vy_meas
 
-            # logging
-            t_now = time.time() - t_start
-            err_x = -thx_f
-            err_y = -thy_f
-            row = [
-                t_now,
-                theta_x, theta_y, theta_z,
-                thx_f, thy_f, dthx_f, dthy_f,
-                # encoder positions & velocities (motor shaft)
-                enc_pos_1, enc_pos_2, enc_pos_3,
-                dpsi_1, dpsi_2, dpsi_3,
-                # ball kinematics
-                phi_x, phi_y, phi_z,
-                dphi_x, dphi_y, dphi_z,
-                err_x, err_y,
-                Tx, Ty, Tz, u1, u2, u3,
-                pid_x.kp, pid_x.ki, pid_x.kd, pid_y.kp, pid_y.ki, pid_y.kd,
-                pwm_cap, abort,
-            ]
-            dl.appendData(row)
+                            # Map velocity error to desired lean, saturate at THETA_MAX_RAD
+                            theta_d_y_cmd = VEL_ACC_GAIN * error_vx       # pitch for forward/back
+                            theta_d_x_cmd = -VEL_ACC_GAIN * error_vy      # roll for lateral
 
-            # brief console output
-            print(
-                f"t={t_now:5.2f}s | θ(deg)=({np.rad2deg(thx_f):+5.2f},{np.rad2deg(thy_f):+5.2f}) "
-                f"| Tx/Ty=({Tx:+.3f},{Ty:+.3f}) | u=({u1:+.3f},{u2:+.3f},{u3:+.3f}) | cap={pwm_cap:.2f} | abort={abort}"
-                f"(X:({pid_x.kp:.3f},{pid_x.ki:.3f},{pid_x.kd:.3f}) Y:({pid_y.kp:.3f},{pid_y.ki:.3f},{pid_y.kd:.3f})"
-            )
+                            theta_d_y = func_clip(theta_d_y_cmd, -THETA_MAX_RAD, THETA_MAX_RAD)
+                            theta_d_x = func_clip(theta_d_x_cmd, -THETA_MAX_RAD, THETA_MAX_RAD)
+                        # else: no commands so stay upright (theta_d = 0)
+                    # else: too far leaned so stay upright and let balance loop recover
 
-            #print PID debug
-            print(f"PID X Debug: {dbgx}")
-            print(f"PID Y Debug: {dbgy}")
+                # ====================================================================
+                # STEP 3: BALANCE LOOP (ANGLE -> TORQUE)
+                # ====================================================================
+                # Lean errors for inner balance loop
+                e_x = theta_d_x - theta_x   # roll  error 
+                e_y = theta_d_y - theta_y   # pitch error 
 
-            # rate control
-            loop_dt = time.time() - loop_t0
-            sleep_t = DT - loop_dt
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+                Tx = Ty = Tz = 0.0
+
+                if not abort:
+                    # Single inner loop: angles ->  torques
+                    Tx = pid_y.update(e_y, dt)   # pitch -> Tx
+                    Ty = pid_x.update(e_x, dt)   # roll  -> Ty
+                    Tx = func_clip(Tx, -PWM_USER_CAP, PWM_USER_CAP)
+                    Ty = func_clip(Ty, -PWM_USER_CAP, PWM_USER_CAP)
+                    Tz = 0.0  # still no yaw control
+                else:
+                    # Emergency stop if too lean
+                    Tx = Ty = Tz = 0.0
+                    pid_x.reset()
+                    pid_y.reset()
+                    pid_x_steer.reset()
+                    pid_y_steer.reset()
+                    print(
+                        f"ABORT: Lean angle too high! "
+                        f"theta_x={np.rad2deg(theta_x):.1f}°, theta_y={np.rad2deg(theta_y):.1f}°"
+                    )
+
+                # motor commands
+                u1,u2,u3 = calc_torque_conv(Tx,Ty,Tz)
+                u1 = func_clip(u1,-PWM_MAX,PWM_MAX)
+                u2 = func_clip(u2,-PWM_MAX,PWM_MAX)
+                u3 = func_clip(u3,-PWM_MAX,PWM_MAX)
+                cmd_utime = int(time.time() * 1e6)
+                command.utime = cmd_utime
+                command.pwm[0] = u1
+                command.pwm[1] = u2
+                command.pwm[2] = u3
+                lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+
+
+                # ======= Data Logging =======
+                kp_x_term = pid_x.kp * e_x
+                ki_x_term = pid_x.ki * pid_x._i
+                kd_x_term = pid_x.kd * pid_x._d_filtered
+                u_pid_x = Ty
+
+                kp_y_term = pid_y.kp * e_y
+                ki_y_term = pid_y.ki * pid_y._i
+                kd_y_term = pid_y.kd * pid_y._d_filtered
+                u_pid_y = Tx
+
+                # Assemble data row matching the header order declared above
+                data = [
+                    i,                    # index
+                    t_now,
+                    float(Tx),
+                    float(Ty),
+                    float(Tz),
+                    float(u1),
+                    float(u2),
+                    float(u3),
+                    float(np.rad2deg(theta_x)),
+                    float(np.rad2deg(theta_y)),
+                    float(np.rad2deg(theta_z)),
+                    float(psi_1),
+                    float(psi_2),
+                    float(psi_3),
+                    float(dpsi_1),
+                    float(dpsi_2),
+                    float(dpsi_3),
+                    # extra PID-related fields
+                    float(np.rad2deg(e_x)),
+                    float(np.rad2deg(e_y)),
+                    float(abort),
+                    float(pid_x.kp),
+                    float(pid_x.ki),
+                    float(pid_x.kd),
+                    float(pid_y.kp),
+                    float(pid_y.ki),
+                    float(pid_y.kd),
+                ]
+                dl.appendData(data)
+                
+                if BALANCE_MODE:
+                    abort_str = " [ABORT]" if abort else ""
+                    print(
+                        f"Time: {t_now:.3f}s{abort_str} | θx: {np.rad2deg(theta_x):+6.2f}°, θy: {np.rad2deg(theta_y):+6.2f}° | "
+                        f"Kp_x: {pid_x.kp:.3f}, Ki_x: {pid_x.ki:.4f}, Kd_x: {pid_x.kd:.4f} | "
+                        f"Kp_y: {pid_y.kp:.3f}, Ki_y: {pid_y.ki:.4f}, Kd_y: {pid_y.kd:.4f} | "
+                        f"Tx: {Tx:+6.3f}, Ty: {Ty:+6.3f} | u1: {u1:+6.3f}, u2: {u2:+6.3f}, u3: {u3:+6.3f}"
+                    )
+                    if cur_tune == 0:
+                        print("Tuning Kp")
+                    elif cur_tune == 1:
+                        print("Tuning Kd")
+                    else:
+                        print("Tuning Ki")
+                else:
+                    print(
+                        f"[STEERING] t={t_now:6.3f}s | "
+                        f"θx={np.rad2deg(theta_x):+6.2f}° (d={np.rad2deg(theta_d_x):+6.2f}°) | "
+                        f"θy={np.rad2deg(theta_y):+6.2f}° (d={np.rad2deg(theta_d_y):+6.2f}°) | "
+                        f"vx cmd={vx_desired:+6.3f}, meas={vx_meas:+6.3f} | "
+                        f"vy cmd={vy_desired:+6.3f}, meas={vy_meas:+6.3f} | "
+                        f"Tx={Tx:+6.3f}, Ty={Ty:+6.3f} | "
+                        f"Kx(Kp,Ki,Kd)=({pid_x.kp:.3f},{pid_x.ki:.4f},{pid_x.kd:.4f}) | "
+                        f"Ky(Kp,Ki,Kd)=({pid_y.kp:.3f},{pid_y.ki:.4f},{pid_y.kd:.4f})"
+                    )
+
+                    # Indicate which gain is currently being tuned via D-pad
+                    if cur_tune == 0:
+                        print("    D-Pad tuning: Kp (both axes)")
+                    elif cur_tune == 1:
+                        print("    D-Pad tuning: Kd (both axes)")
+                    else:
+                        print("    D-Pad tuning: Ki (both axes)")
+
+                    
+
+            except KeyError:
+                print("Waiting for sensor data...")
 
     except KeyboardInterrupt:
-        print("\nKeyboard interrupt received. Stopping motors...")
-
-    finally:
-        # stop motors
+        print("Keyboard interrupt received. Stopping motors...")
         command = mbot_motor_pwm_t()
         command.utime = int(time.time() * 1e6)
         command.pwm[0] = 0.0
@@ -448,27 +514,21 @@ def main():
         command.pwm[2] = 0.0
         lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
 
-        # save data
+    finally:
         print(f"Saving data as {filename}...")
         dl.writeOut()
-
-        # stop listener thread
         listening = False
         print("Stopping LCM listener...")
-        try:
-            listener_thread.join(timeout=1)
-        except Exception:
-            pass
-
-        # stop PS4 controller thread gracefully
-        try:
-            controller.on_options_press()
-            controller_thread.join(timeout=1)
-        except Exception:
-            pass
-
-        print("Shutting down complete.\n")
-
+        listener_thread.join(timeout=1)
+        controller_thread.join(timeout=1)
+        controller.on_options_press()
+        print("Shutting down motors...")
+        command = mbot_motor_pwm_t()
+        command.utime = int(time.time() * 1e6)
+        command.pwm[0] = 0.0
+        command.pwm[1] = 0.0
+        command.pwm[2] = 0.0
+        lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
 
 if __name__ == "__main__":
     main()
