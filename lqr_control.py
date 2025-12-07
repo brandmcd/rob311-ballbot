@@ -1,0 +1,643 @@
+import time
+import lcm
+import threading
+import numpy as np
+from mbot_lcm_msgs.mbot_motor_pwm_t import mbot_motor_pwm_t
+from mbot_lcm_msgs.mbot_balbot_feedback_t import mbot_balbot_feedback_t
+from DataLogger3 import dataLogger
+from ps4_controller_api import PS4InputHandler
+
+# ===== helpers =====
+from pid import PID
+
+# Constants for the control loop
+FREQ = 100  # Frequency of control loop [Hz]
+DT = 1 / FREQ  # Time step for each iteration [sec]
+PWM_MAX = 0.96
+N_GEARBOX = 70
+N_ENC = 64
+R_W = 0.048
+R_K = 0.121
+alpha = 45*(np.pi/180)
+
+# Steering/balance coordination
+THETA_MAX_DEG = 3
+THETA_MAX_RAD = np.deg2rad(THETA_MAX_DEG)
+VEL_ACC_GAIN = 0.5   # a_des = VEL_ACC_GAIN * (v_des - v_meas)
+VEL_FILT_ALPHA = 0.25  # EMA for measured ball velocities dPhi
+
+# Steering safety: above this lean, ignore velocity commands & just balance
+TH_STEER_PRIOR_DEG = 3.0
+TH_STEER_PRIOR_RAD = np.deg2rad(TH_STEER_PRIOR_DEG)
+VEL_CMD_EPS = 1e-3
+
+# Set to True to enable balance mode (LQR control on lean angles)
+BALANCE_MODE = True
+
+# Safety parameters
+TH_ABORT_DEG = 25.0         # hard abort if tilt exceeds this (degrees)
+PWM_USER_CAP = 0.96         # actuator saturation during balancing
+
+# Global flags to control the listening thread & msg data
+listening = False
+msg = mbot_balbot_feedback_t()
+last_time = 0
+last_seen = {"MBOT_BALBOT_FEEDBACK": 0}
+
+def feedback_handler(channel, data):
+    global msg, last_seen, last_time
+    last_time = time.time()
+    last_seen[channel] = time.time()
+    msg = mbot_balbot_feedback_t.decode(data)
+
+
+def lcm_listener(lc):
+    global listening
+    while listening:
+        try:
+            lc.handle_timeout(100)
+            if time.time() - last_time > 2.0:
+                print("LCM Publisher seems inactive...")
+            elif time.time() - last_seen["MBOT_BALBOT_FEEDBACK"] > 2.0:
+                print("LCM MBOT_BALBOT_FEEDBACK node seems inactive...")
+        except Exception as e:
+            print(f"LCM listening error: {e}")
+            break
+
+
+def calc_enc2rad(ticks):
+    return (2*np.pi*ticks)/(N_ENC*N_GEARBOX)
+
+
+def calc_torque_conv(Tx,Ty,Tz):
+    u1 = (1/3)*(Tz- ((2*Ty)/np.cos(alpha)))
+    u2 = (1/3)*(Tz + (1/np.cos(alpha))*(-np.sqrt(3)*Tx + Ty))
+    u3 = (1/3)*(Tz + (1/np.cos(alpha))*(np.sqrt(3)*Tx + Ty))
+    return u1, u2, u3
+
+
+def calc_kinematic_conv(psi1,psi2,psi3):
+    phi_x = (np.sqrt(2/3))*(R_W/R_K)*(psi2 - psi3)
+    phi_y = (np.sqrt(2)/3)*(R_W/R_K)*(-2*psi1 + psi2 + psi3)
+    phi_z = (np.sqrt(2)/3)*(R_W/R_K)*(psi1 + psi2 + psi3)
+    return phi_x, phi_y, phi_z
+
+
+def func_clip(x,lim_lo,lim_hi):
+    if x > lim_hi: x = lim_hi
+    elif x < lim_lo: x = lim_lo
+    return x
+
+
+def too_lean(theta_x, theta_y, deg_limit):
+    """Return True if the robot is leaned beyond deg_limit (in degrees)."""
+    return (abs(theta_x) > np.deg2rad(deg_limit)) or (abs(theta_y) > np.deg2rad(deg_limit))
+
+
+class LQRController:
+    """LQR Controller for balancing"""
+    def __init__(self, Q=None, R=None, dt=DT):
+        """
+        Initialize LQR controller.
+        States: [theta_x, theta_y, theta_x_dot, theta_y_dot]
+        Inputs: [Tx, Ty]
+        
+        For simplicity, we'll assume decoupled x and y dynamics and design separate controllers.
+        """
+        self.dt = dt
+        
+        # Default LQR weights if not provided
+        if Q is None:
+            # Weight on state errors: [theta, theta_dot]
+            self.Q_x = np.diag([10.0, 0.1])  # Increased weight on angle error
+            self.Q_y = np.diag([10.0, 0.1])
+        else:
+            self.Q_x = Q
+            self.Q_y = Q
+            
+        if R is None:
+            # Weight on control effort
+            self.R_x = np.array([[0.01]])
+            self.R_y = np.array([[0.01]])
+        else:
+            self.R_x = R
+            self.R_y = R
+            
+        # System matrices for linearized pendulum dynamics
+        # For a simple pendulum: theta_ddot = (g/L)*theta + (1/(m*L^2))*u
+        # Approximated as continuous-time: A = [[0, 1], [g/L, 0]], B = [[0], [1/(m*L^2)]]
+        
+        # Estimated parameters (tune these based on your system)
+        self.g = 9.81  # gravity
+        self.L = 0.2   # effective pendulum length (estimate)
+        self.m = 5   # mass (estimate)
+        
+        # Continuous-time system matrices (decoupled x and y)
+        self.A_c = np.array([[0, 1], 
+                            [self.g/self.L, 0]])
+        self.B_c = np.array([[0], 
+                            [1/(self.m * self.L**2)]])
+        
+        # Discrete-time system matrices (using zero-order hold)
+        self.A_d, self.B_d = self._discretize_system()
+        
+        # Compute LQR gains using Discrete Algebraic Riccati Equation (DARE)
+        self.K_x = self._compute_lqr_gain(self.Q_x, self.R_x)
+        self.K_y = self._compute_lqr_gain(self.Q_y, self.R_y)
+        
+        # State history for derivative estimation
+        self.prev_theta_x = 0
+        self.prev_theta_y = 0
+        self.prev_time = time.time()
+        
+        # Filter for angular velocity estimation
+        self.theta_x_dot_filt = 0
+        self.theta_y_dot_filt = 0
+        self.alpha_vel = 0.2  # EMA filter coefficient for velocity
+        
+        # Output limits
+        self.u_min = -PWM_USER_CAP
+        self.u_max = PWM_USER_CAP
+        
+        print(f"LQR Controller initialized with gains:")
+        print(f"  K_x: {self.K_x}")
+        print(f"  K_y: {self.K_y}")
+    
+    def _discretize_system(self):
+        """Convert continuous-time system to discrete-time using matrix exponential"""
+        # For simplicity, use Euler approximation for small dt
+        A_d = np.eye(2) + self.A_c * self.dt
+        B_d = self.B_c * self.dt
+        return A_d, B_d
+    
+    def _compute_lqr_gain(self, Q, R):
+        """Solve Discrete Algebraic Riccati Equation (DARE) for LQR gain"""
+        # Simple iterative solution for DARE (for 2x2 system)
+        P = Q.copy()
+        
+        # Iterate until convergence
+        for _ in range(1000):
+            K = np.linalg.inv(R + self.B_d.T @ P @ self.B_d) @ self.B_d.T @ P @ self.A_d
+            P_new = Q + self.A_d.T @ P @ self.A_d - self.A_d.T @ P @ self.B_d @ K
+            
+            if np.max(np.abs(P_new - P)) < 1e-6:
+                break
+            P = P_new
+            
+        # Compute final gain
+        K = np.linalg.inv(R + self.B_d.T @ P @ self.B_d) @ self.B_d.T @ P @ self.A_d
+        return K.flatten()
+    
+    def estimate_angular_velocity(self, theta, prev_theta, dt):
+        """Estimate angular velocity with filtering"""
+        if dt <= 0:
+            return 0
+        theta_dot = (theta - prev_theta) / dt
+        return theta_dot
+    
+    def update(self, theta_x, theta_y, dt=None):
+        """
+        Compute LQR control inputs.
+        Returns: Tx, Ty (torques for x and y axes)
+        """
+        if dt is None:
+            dt = self.dt
+            
+        # Estimate angular velocities
+        current_time = time.time()
+        actual_dt = current_time - self.prev_time
+        actual_dt = max(actual_dt, 1e-6)  # Avoid division by zero
+        
+        # Raw velocity estimates
+        theta_x_dot_raw = self.estimate_angular_velocity(theta_x, self.prev_theta_x, actual_dt)
+        theta_y_dot_raw = self.estimate_angular_velocity(theta_y, self.prev_theta_y, actual_dt)
+        
+        # Apply EMA filter to reduce noise
+        self.theta_x_dot_filt = (1 - self.alpha_vel) * self.theta_x_dot_filt + self.alpha_vel * theta_x_dot_raw
+        self.theta_y_dot_filt = (1 - self.alpha_vel) * self.theta_y_dot_filt + self.alpha_vel * theta_y_dot_raw
+        
+        # Update previous values
+        self.prev_theta_x = theta_x
+        self.prev_theta_y = theta_y
+        self.prev_time = current_time
+        
+        # State vectors (error states)
+        # We want to stabilize at [0, 0], so state = [theta, theta_dot]
+        x_state = np.array([theta_x, self.theta_x_dot_filt])
+        y_state = np.array([theta_y, self.theta_y_dot_filt])
+        
+        # Compute LQR control: u = -K * x
+        u_x = -np.dot(self.K_x, x_state)
+        u_y = -np.dot(self.K_y, y_state)
+        
+        # Apply saturation
+        u_x = func_clip(u_x, self.u_min, self.u_max)
+        u_y = func_clip(u_y, self.u_min, self.u_max)
+        
+        # Note: In the original PID, Ty corresponds to x-axis control and Tx corresponds to y-axis control
+        # We'll maintain this convention: u_x -> Ty (roll), u_y -> Tx (pitch)
+        return u_y, u_x  # Return as Tx, Ty
+    
+    def reset(self):
+        """Reset the controller state"""
+        self.prev_theta_x = 0
+        self.prev_theta_y = 0
+        self.prev_time = time.time()
+        self.theta_x_dot_filt = 0
+        self.theta_y_dot_filt = 0
+        
+    def update_gains(self, Q_scale=None, R_scale=None):
+        """Update LQR gains with new Q/R matrices"""
+        if Q_scale is not None:
+            self.Q_x = Q_scale * np.diag([10.0, 0.1])
+            self.Q_y = Q_scale * np.diag([10.0, 0.1])
+            
+        if R_scale is not None:
+            self.R_x = np.array([[R_scale]])
+            self.R_y = np.array([[R_scale]])
+            
+        # Recompute gains
+        self.K_x = self._compute_lqr_gain(self.Q_x, self.R_x)
+        self.K_y = self._compute_lqr_gain(self.Q_y, self.R_y)
+
+
+def main():
+    # === Data Logging Initialization ===
+    trial_num = int(input("Test Number? "))
+    filename = f"main_control_lqr_{trial_num}.txt"
+    dl = dataLogger(filename)
+
+    # === LCM Messaging Initialization ===
+    global listening, msg, BALANCE_MODE
+    lc = lcm.LCM("udpm://239.255.76.67:7667?ttl=0")
+    subscription = lc.subscribe("MBOT_BALBOT_FEEDBACK", feedback_handler)
+    listening = True
+    listener_thread = threading.Thread(target=lcm_listener, args=(lc,), daemon=True)
+    listener_thread.start()
+    print("Started continuous LCM listener...")
+
+    # === Controller Initialization ===
+    controller = PS4InputHandler(interface="/dev/input/js0",connecting_using_ds4drv=False)
+    controller_thread = threading.Thread(target=controller.listen, args=(10,))
+    controller_thread.daemon = True
+    controller_thread.start()
+    print("PS4 Controller is active...")
+    print("Controls: Triangle=KILL, Circle=Reset IMU, L/R sticks=manual control (when BALANCE_MODE=False)")
+
+    # Initialize LQR controller for balance
+    lqr_controller = LQRController()
+    
+    # Keep PID for steering mode
+    pid_x_steer = PID(kp=12, ki=0.1, kd=0, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
+    pid_y_steer = PID(kp=12, ki=0.1, kd=0, u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP, d_window=5)
+
+    try:
+        command = mbot_motor_pwm_t()
+        print("Starting steering control loop with LQR balance...")
+        time.sleep(0.5)
+        
+        # Logging header for LQR
+        header = [
+            "i",
+            "t_now",
+            "Tx",
+            "Ty",
+            "Tz",
+            "u1",
+            "u2",
+            "u3",
+            "theta_x",
+            "theta_y",
+            "theta_z",
+            "psi_1",
+            "psi_2",
+            "psi_3",
+            "dpsi_1",
+            "dpsi_2",
+            "dpsi_3",
+            # LQR-specific fields
+            "theta_x_dot",
+            "theta_y_dot",
+            "e_x",
+            "e_y",
+            "abort",
+            "K_x_0", "K_x_1",  # LQR gains for x
+            "K_y_0", "K_y_1",  # LQR gains for y
+            "Q_scale",         # Current Q scaling
+            "R_scale",         # Current R scaling
+        ]
+        dl.appendData(header)
+
+        i = 0
+        t_start = time.time()
+        t_now = 0
+        enc_pos_1_start = msg.enc_ticks[0]
+        enc_pos_2_start = msg.enc_ticks[1]
+        enc_pos_3_start = msg.enc_ticks[2]
+        u1 = u2 = u3 = 0
+        # zero angles on first sample per lab note
+        theta_x_0 = msg.imu_angles_rpy[0]
+        theta_y_0 = msg.imu_angles_rpy[1]
+        theta_z_0 = msg.imu_angles_rpy[2]
+        print(f"IMU offsets set: theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
+        prev_t = time.time()
+        # filtered ball velocity states
+        vx_filt = 0.0
+        vy_filt = 0.0
+        
+        # PS4 button state tracking for edge detection
+        prev_tri = 0
+        prev_cir = 0
+        prev_x = 0
+        
+        # D-pad tuning variables for LQR
+        step = 0.1
+        cur_tune = 0  # 0 for Q scaling, 1 for R scaling
+        prev_dpad_h = 0
+        prev_dpad_vert = 0
+        Q_scale = 1.0
+        R_scale = 1.0
+
+        while True:
+            time.sleep(DT)
+            t_now = time.time() - t_start
+            i += 1
+
+            try:
+                # gamepad
+                bt_signals = controller.get_signals()
+                js_R_x = bt_signals["js_R_x"]
+                js_R_y = bt_signals["js_R_y"]
+                js_L_x = bt_signals["js_L_x"]
+                js_L_y = bt_signals["js_L_y"]
+                trigger_L2 = bt_signals["trigger_L2"]
+                trigger_R2 = bt_signals["trigger_R2"]
+                
+                # D-pad tuning
+                dpad_h = bt_signals["dpad_horiz"]
+                dpad_vert = bt_signals["dpad_vert"]
+                
+                # select parameter to tune with dpad horizontal
+                if dpad_h > prev_dpad_h:
+                    cur_tune = (cur_tune + 1) % 2
+                elif dpad_h < prev_dpad_h:
+                    cur_tune = (cur_tune - 1) % 2
+                
+                # Adjust LQR parameters with dpad vertical
+                if dpad_vert > prev_dpad_vert:
+                    if cur_tune == 0:  # Adjust Q (state cost)
+                        Q_scale *= 1.1  # Increase by 10%
+                        lqr_controller.update_gains(Q_scale=Q_scale, R_scale=None)
+                    else:  # Adjust R (control cost)
+                        R_scale *= 1.1  # Increase by 10%
+                        lqr_controller.update_gains(Q_scale=None, R_scale=R_scale)
+                elif dpad_vert < prev_dpad_vert:
+                    if cur_tune == 0:  # Adjust Q
+                        Q_scale /= 1.1  # Decrease by ~9%
+                        lqr_controller.update_gains(Q_scale=Q_scale, R_scale=None)
+                    else:  # Adjust R
+                        R_scale /= 1.1  # Decrease by ~9%
+                        lqr_controller.update_gains(Q_scale=None, R_scale=R_scale)
+                
+                prev_dpad_h = dpad_h 
+                prev_dpad_vert = dpad_vert
+                
+                # Safety buttons - Triangle kill, Circle IMU reset, and X to toggle balance/manual
+                tri = bt_signals.get("but_tri", 0)
+                cir = bt_signals.get("but_cir", 0)
+                sqr = bt_signals.get("but_sqr", 0)
+                but_x = bt_signals.get("but_x", 0)
+                
+                # Triangle kill (immediate stop)
+                if tri and not prev_tri:
+                    print("PS4 KILL (Triangle) pressed - stopping motors and exiting.")
+                    command = mbot_motor_pwm_t()
+                    command.utime = int(time.time() * 1e6)
+                    command.pwm[:] = [0.0, 0.0, 0.0]
+                    lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+                    break
+                
+                # Circle IMU reset
+                if cir and not prev_cir:
+                    theta_x_0 = msg.imu_angles_rpy[0]
+                    theta_y_0 = msg.imu_angles_rpy[1]
+                    theta_z_0 = msg.imu_angles_rpy[2]
+                    lqr_controller.reset()
+                    pid_x_steer.reset()
+                    pid_y_steer.reset()
+                    print(f"IMU reset (Circle): theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
+                
+                # X button toggles between balance and manual modes on press-edge
+                if but_x and not prev_x:
+                    BALANCE_MODE = not BALANCE_MODE
+                    mode_str = "LQR BALANCE" if BALANCE_MODE else "MANUAL/STEERING"
+                    print(f"Mode toggled (X): {mode_str}")
+
+                prev_tri = tri
+                prev_cir = cir
+                prev_x = but_x
+
+                # sensors
+                theta_x = msg.imu_angles_rpy[0] - theta_x_0
+                theta_y = msg.imu_angles_rpy[1] - theta_y_0
+                theta_z = msg.imu_angles_rpy[2] - theta_z_0
+                enc_pos_1 = msg.enc_ticks[0] - enc_pos_1_start
+                enc_pos_2 = msg.enc_ticks[1] - enc_pos_2_start
+                enc_pos_3 = msg.enc_ticks[2] - enc_pos_3_start
+                enc_dtick_1 = msg.enc_delta_ticks[0]
+                enc_dtick_2 = msg.enc_delta_ticks[1]
+                enc_dtick_3 = msg.enc_delta_ticks[2]
+                enc_dt = msg.enc_delta_time
+
+                # wheel kinematics
+                psi_1 = calc_enc2rad(enc_pos_1)
+                psi_2 = calc_enc2rad(enc_pos_2)
+                psi_3 = calc_enc2rad(enc_pos_3)
+                # avoid div by zero
+                enc_dt = max(enc_dt, 1e-6)
+                dpsi_1 = calc_enc2rad(enc_dtick_1)/(enc_dt*1e-6)
+                dpsi_2 = calc_enc2rad(enc_dtick_2)/(enc_dt*1e-6)
+                dpsi_3 = calc_enc2rad(enc_dtick_3)/(enc_dt*1e-6)
+                phi_x, phi_y, phi_z = calc_kinematic_conv(psi_1,psi_2,psi_3)
+                dphi_x, dphi_y, dphi_z = calc_kinematic_conv(dpsi_1,dpsi_2,dpsi_3)
+
+                # Safety check - abort if too lean
+                abort = too_lean(theta_x, theta_y, TH_ABORT_DEG)
+                    
+                now_t = time.time()
+                dt = max(1e-6, now_t - prev_t)
+                prev_t = now_t
+
+                # ====================================================================
+                # STEP 2A: JOYSTICK -> DESIRED VELOCITIES
+                # ====================================================================
+                DEADZONE  = 0.08
+
+                js_fwd   = -js_R_y if abs(js_R_y) > DEADZONE else 0.0   # forward/back
+                js_strafe = js_R_x if abs(js_R_x) > DEADZONE else 0.0   # left/right
+                js_fwd = np.sign(js_fwd) * (js_fwd**2)
+                js_strafe = np.sign(js_strafe) * (js_strafe**2)
+
+                # ====================================================================
+                # STEP 2B: DESIRED LEAN ANGLES (STEERING VIA LEAN ONLY)
+                # ====================================================================
+                # Default: pure balance (upright)
+                theta_d_x = 0.0  # desired roll (for vy)
+                theta_d_y = 0.0  # desired pitch (for vx)
+
+                if not BALANCE_MODE:
+                    # Command lean directly from joystick (no velocity loop)
+                    if abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS:
+                        theta_d_y = -THETA_MAX_RAD * js_fwd      # pitch  (vx)
+                        theta_d_x =  THETA_MAX_RAD * js_strafe    # roll   (vy)
+                    else:
+                        theta_d_x = 0.0
+                        theta_d_y = 0.0
+
+                # Lean errors for logging (desired minus actual)
+                e_x = theta_d_x - theta_x   # roll error
+                e_y = theta_d_y - theta_y   # pitch error
+
+                Tx_balance = Ty_balance = 0.0
+                Tx_steer   = Ty_steer   = 0.0
+                Tx = Ty = Tz = 0.0
+
+                if not abort:
+                    # LQR balance control (always active for stability)
+                    Ty_balance, Tx_balance = lqr_controller.update(theta_x, theta_y, dt)
+
+                    if BALANCE_MODE:
+                        # Pure LQR balance mode
+                        pid_x_steer.reset()
+                        pid_y_steer.reset()
+                        Tx = func_clip(Tx_balance, -PWM_USER_CAP, PWM_USER_CAP)
+                        Ty = func_clip(Ty_balance, -PWM_USER_CAP, PWM_USER_CAP)
+                        Tz = 0.0
+                    else:
+                        # Steering via lean angle: add steering torques when safe and commanded
+                        if (
+                            (abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS)
+                            and (abs(theta_x) < TH_STEER_PRIOR_RAD and abs(theta_y) < TH_STEER_PRIOR_RAD)
+                        ):
+                            Tx_steer = pid_y_steer.update(e_y, dt)  # Note: e_y is pitch error -> Tx
+                            Ty_steer = pid_x_steer.update(e_x, dt)  # Note: e_x is roll error -> Ty
+                        else:
+                            pid_x_steer.reset()
+                            pid_y_steer.reset()
+                            Tx_steer = 0.0
+                            Ty_steer = 0.0
+
+                        Tx = func_clip(Tx_balance + Tx_steer, -PWM_USER_CAP, PWM_USER_CAP)
+                        Ty = func_clip(Ty_balance + Ty_steer, -PWM_USER_CAP, PWM_USER_CAP)
+                        Tz = 0.0
+                else:
+                    # Emergency stop if too lean
+                    Tx = Ty = Tz = 0.0
+                    lqr_controller.reset()
+                    pid_x_steer.reset()
+                    pid_y_steer.reset()
+                    print(
+                        f"ABORT: Lean angle too high! "
+                        f"theta_x={np.rad2deg(theta_x):.1f}°, theta_y={np.rad2deg(theta_y):.1f}°"
+                    )
+
+                # motor commands
+                u3,u1,u2 = calc_torque_conv(Tx,Ty,Tz)
+                u1 = -func_clip(u1,-PWM_MAX,PWM_MAX)
+                u2 = -func_clip(u2,-PWM_MAX,PWM_MAX)
+                u3 = -func_clip(u3,-PWM_MAX,PWM_MAX)
+                cmd_utime = int(time.time() * 1e6)
+                command.utime = cmd_utime
+                command.pwm[0] = u1/2
+                command.pwm[1] = u2/2
+                command.pwm[2] = u3/2
+                lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+
+                # ======= Data Logging =======
+                data = [
+                    i,                    # index
+                    t_now,
+                    float(Tx),
+                    float(Ty),
+                    float(Tz),
+                    float(u1),
+                    float(u2),
+                    float(u3),
+                    float(np.rad2deg(theta_x)),
+                    float(np.rad2deg(theta_y)),
+                    float(np.rad2deg(theta_z)),
+                    float(psi_1),
+                    float(psi_2),
+                    float(psi_3),
+                    float(dpsi_1),
+                    float(dpsi_2),
+                    float(dpsi_3),
+                    # LQR-specific fields
+                    float(lqr_controller.theta_x_dot_filt),
+                    float(lqr_controller.theta_y_dot_filt),
+                    float(np.rad2deg(e_x)),
+                    float(np.rad2deg(e_y)),
+                    float(abort),
+                    float(lqr_controller.K_x[0]),
+                    float(lqr_controller.K_x[1]),
+                    float(lqr_controller.K_y[0]),
+                    float(lqr_controller.K_y[1]),
+                    float(Q_scale),
+                    float(R_scale),
+                ]
+                dl.appendData(data)
+                
+                if BALANCE_MODE:
+                    abort_str = " [ABORT]" if abort else ""
+                    print(
+                        f"Time: {t_now:.3f}s{abort_str} | "
+                        f"θx: {np.rad2deg(theta_x):+6.2f}°, θy: {np.rad2deg(theta_y):+6.2f}° | "
+                        f"θx_dot: {lqr_controller.theta_x_dot_filt:+6.3f}, θy_dot: {lqr_controller.theta_y_dot_filt:+6.3f} | "
+                        f"LQR K_x: [{lqr_controller.K_x[0]:+6.3f}, {lqr_controller.K_x[1]:+6.3f}] | "
+                        f"LQR K_y: [{lqr_controller.K_y[0]:+6.3f}, {lqr_controller.K_y[1]:+6.3f}] | "
+                        f"Q_scale: {Q_scale:.3f}, R_scale: {R_scale:.3f} | "
+                        f"Tx: {Tx:+6.3f}, Ty: {Ty:+6.3f}"
+                    )
+                    if cur_tune == 0:
+                        print("Tuning Q (state cost)")
+                    else:
+                        print("Tuning R (control cost)")
+                else:
+                    print(
+                        f"[STEERING] t={t_now:6.3f}s | "
+                        f"θx={np.rad2deg(theta_x):+6.2f}° (d={np.rad2deg(theta_d_x):+6.2f}°) | "
+                        f"θy={np.rad2deg(theta_y):+6.2f}° (d={np.rad2deg(theta_d_y):+6.2f}°) | "
+                        f"fwd_cmd={js_fwd:+.2f}, strf_cmd={js_strafe:+.2f} | "
+                        f"Tx={Tx:+6.3f}, Ty={Ty:+6.3f}"
+                    )
+
+            except KeyError:
+                print("Waiting for sensor data...")
+
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received. Stopping motors...")
+        command = mbot_motor_pwm_t()
+        command.utime = int(time.time() * 1e6)
+        command.pwm[0] = 0.0
+        command.pwm[1] = 0.0
+        command.pwm[2] = 0.0
+        lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+
+    finally:
+        print(f"Saving data as {filename}...")
+        dl.writeOut()
+        listening = False
+        print("Stopping LCM listener...")
+        listener_thread.join(timeout=1)
+        controller_thread.join(timeout=1)
+        controller.on_options_press()
+        print("Shutting down motors...")
+        command = mbot_motor_pwm_t()
+        command.utime = int(time.time() * 1e6)
+        command.pwm[0] = 0.0
+        command.pwm[1] = 0.0
+        command.pwm[2] = 0.0
+        lc.publish("MBOT_MOTOR_PWM_CMD", command.encode())
+
+if __name__ == "__main__":
+    main()
