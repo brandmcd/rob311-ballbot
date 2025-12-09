@@ -24,18 +24,19 @@ alpha = 45 * (np.pi/180)
 # ===== BALANCE PARAMETERS =====
 BALANCE_KP = 8.6
 BALANCE_KI = 0.13
-BALANCE_KD = 0.018
+BALANCE_KD = 0.03  # Increased from 0.018 for better damping
+
+# ===== POSITION CONTROL PARAMETERS =====
+# These create a "virtual spring" that pulls the robot back to center
+POSITION_KP = 0.8    # Position to angle conversion
+POSITION_KD = 0.15   # Velocity damping
+POSITION_MAX_ANGLE_DEG = 5.0  # Max tilt for position correction
+POSITION_MAX_ANGLE_RAD = np.deg2rad(POSITION_MAX_ANGLE_DEG)
 
 # ===== STEERING PARAMETERS =====
-STEER_KP = 7.0
-STEER_KI = 0.04
-STEER_KD = 0.015
-
-# Steering limits
+# Steering limits - used for joystick commands
 THETA_MAX_DEG = 3.0
 THETA_MAX_RAD = np.deg2rad(THETA_MAX_DEG)
-TH_STEER_PRIOR_DEG = 3.0
-TH_STEER_PRIOR_RAD = np.deg2rad(TH_STEER_PRIOR_DEG)
 VEL_CMD_EPS = 1e-3
 
 # Safety
@@ -119,7 +120,7 @@ def main():
     print("  Right Stick = Steering (when not in balance mode)")
     print("  D-Pad = Tune PID gains")
 
-    # === PID Controllers - Using your working gains as baseline ===
+    # === PID Controllers - Single unified controller with position feedback ===
     pid_x = PID(
         kp=BALANCE_KP, ki=BALANCE_KI, kd=BALANCE_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
@@ -128,18 +129,6 @@ def main():
     )
     pid_y = PID(
         kp=BALANCE_KP, ki=BALANCE_KI, kd=BALANCE_KD,
-        u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
-        integ_min=-0.25, integ_max=0.25,
-        d_window=5, enable_antiwindup=True
-    )
-    pid_x_steer = PID(
-        kp=STEER_KP, ki=STEER_KI, kd=STEER_KD,
-        u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
-        integ_min=-0.25, integ_max=0.25,
-        d_window=5, enable_antiwindup=True
-    )
-    pid_y_steer = PID(
-        kp=STEER_KP, ki=STEER_KI, kd=STEER_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
         integ_min=-0.25, integ_max=0.25,
         d_window=5, enable_antiwindup=True
@@ -156,12 +145,14 @@ def main():
             "Tx", "Ty", "Tz",
             "u1", "u2", "u3",
             "theta_x", "theta_y", "theta_z",
+            "theta_d_x", "theta_d_y",
+            "phi_x", "phi_y", "phi_z",
+            "dphi_x", "dphi_y", "dphi_z",
             "psi_1", "psi_2", "psi_3",
             "dpsi_1", "dpsi_2", "dpsi_3",
             "e_x", "e_y",
             "abort",
-            "kp_x", "ki_x", "kd_x",
-            "kp_y", "ki_y", "kd_y",
+            "kp", "ki", "kd",
         ]
         dl.appendData(header)
 
@@ -330,75 +321,56 @@ def main():
                 prev_t = now_t
                 
                 # ====================================================================
-                # CONTROL LOGIC - EXACTLY like your working code
+                # CONTROL LOGIC - Cascaded position control
                 # ====================================================================
                 DEADZONE = 0.08
                 js_fwd = -js_R_y if abs(js_R_y) > DEADZONE else 0.0
                 js_strafe = js_R_x if abs(js_R_x) > DEADZONE else 0.0
                 js_fwd = np.sign(js_fwd) * (js_fwd**2)
                 js_strafe = np.sign(js_strafe) * (js_strafe**2)
-                
-                # Desired lean angles
-                theta_d_x = 0.0
-                theta_d_y = 0.0
-                
-                if not BALANCE_MODE:
-                    # Command lean directly from joystick
-                    if abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS:
-                        theta_d_y = -THETA_MAX_RAD * js_fwd
-                        theta_d_x = THETA_MAX_RAD * js_strafe
-                    else:
-                        theta_d_x = 0.0
-                        theta_d_y = 0.0
-                
-                # Errors
+
+                # ====================================================================
+                # POSITION CONTROL - Prevent wandering
+                # ====================================================================
+                if BALANCE_MODE:
+                    # Position control: use ball position to generate desired tilt
+                    # This creates a "spring" that pulls robot back to center
+                    theta_d_x = -POSITION_KP * phi_x - POSITION_KD * dphi_x
+                    theta_d_y = -POSITION_KP * phi_y - POSITION_KD * dphi_y
+
+                    # Limit desired angles to prevent excessive lean
+                    theta_d_x = func_clip(theta_d_x, -POSITION_MAX_ANGLE_RAD, POSITION_MAX_ANGLE_RAD)
+                    theta_d_y = func_clip(theta_d_y, -POSITION_MAX_ANGLE_RAD, POSITION_MAX_ANGLE_RAD)
+                else:
+                    # Steering mode: joystick commands desired position velocity
+                    # Position control + steering offset
+                    theta_d_x = -POSITION_KP * phi_x - POSITION_KD * dphi_x + THETA_MAX_RAD * js_strafe
+                    theta_d_y = -POSITION_KP * phi_y - POSITION_KD * dphi_y - THETA_MAX_RAD * js_fwd
+
+                    # Limit desired angles
+                    theta_d_x = func_clip(theta_d_x, -POSITION_MAX_ANGLE_RAD, POSITION_MAX_ANGLE_RAD)
+                    theta_d_y = func_clip(theta_d_y, -POSITION_MAX_ANGLE_RAD, POSITION_MAX_ANGLE_RAD)
+
+                # Errors - now tracking desired angles instead of zero
                 e_x = theta_d_x - theta_x
                 e_y = theta_d_y - theta_y
-                e_bal_x = -theta_x
-                e_bal_y = -theta_y
-                e_str_x = e_x
-                e_str_y = e_y
-                
-                Tx_balance = Ty_balance = 0.0
-                Tx_steer = Ty_steer = 0.0
-                Tx = Ty = Tz = 0.0
-                
+
+                # ====================================================================
+                # UNIFIED CONTROL - Single controller tracking desired angles
+                # ====================================================================
                 if not abort:
-                    # Always compute balance torques
-                    Tx_balance = pid_y.update(e_bal_y, dt)  # pitch -> Tx
-                    Ty_balance = pid_x.update(e_bal_x, dt)  # roll -> Ty
-                    
-                    if BALANCE_MODE:
-                        # Pure balance
-                        pid_x_steer.reset()
-                        pid_y_steer.reset()
-                        Tx = func_clip(Tx_balance, -PWM_USER_CAP, PWM_USER_CAP)
-                        Ty = func_clip(Ty_balance, -PWM_USER_CAP, PWM_USER_CAP)
-                        Tz = 0.0
-                    else:
-                        # Steering: add steering torques
-                        if (
-                            (abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS)
-                            and (abs(theta_x) < TH_STEER_PRIOR_RAD and abs(theta_y) < TH_STEER_PRIOR_RAD)
-                        ):
-                            Tx_steer = pid_y_steer.update(e_str_y, dt)
-                            Ty_steer = pid_x_steer.update(e_str_x, dt)
-                        else:
-                            pid_x_steer.reset()
-                            pid_y_steer.reset()
-                            Tx_steer = 0.0
-                            Ty_steer = 0.0
-                        
-                        Tx = func_clip(Tx_balance + Tx_steer, -PWM_USER_CAP, PWM_USER_CAP)
-                        Ty = func_clip(Ty_balance + Ty_steer, -PWM_USER_CAP, PWM_USER_CAP)
-                        Tz = 0.0
+                    # Single unified controller tracking desired angles
+                    Tx = pid_y.update(e_y, dt)  # pitch -> Tx
+                    Ty = pid_x.update(e_x, dt)  # roll -> Ty
+
+                    Tx = func_clip(Tx, -PWM_USER_CAP, PWM_USER_CAP)
+                    Ty = func_clip(Ty, -PWM_USER_CAP, PWM_USER_CAP)
+                    Tz = 0.0
                 else:
                     # Emergency stop
                     Tx = Ty = Tz = 0.0
                     pid_x.reset()
                     pid_y.reset()
-                    pid_x_steer.reset()
-                    pid_y_steer.reset()
                     print(f"ABORT: Lean angle too high! theta_x={np.rad2deg(theta_x):.1f}°, theta_y={np.rad2deg(theta_y):.1f}°")
                 
                 # ====================================================================
@@ -425,13 +397,16 @@ def main():
                     float(np.rad2deg(theta_x)),
                     float(np.rad2deg(theta_y)),
                     float(np.rad2deg(theta_z)),
+                    float(np.rad2deg(theta_d_x)),
+                    float(np.rad2deg(theta_d_y)),
+                    float(phi_x), float(phi_y), float(phi_z),
+                    float(dphi_x), float(dphi_y), float(dphi_z),
                     float(psi_1), float(psi_2), float(psi_3),
                     float(dpsi_1), float(dpsi_2), float(dpsi_3),
                     float(np.rad2deg(e_x)),
                     float(np.rad2deg(e_y)),
                     float(abort),
                     float(pid_x.kp), float(pid_x.ki), float(pid_x.kd),
-                    float(pid_y.kp), float(pid_y.ki), float(pid_y.kd),
                 ]
                 dl.appendData(data)
                 
@@ -439,33 +414,33 @@ def main():
                 if BALANCE_MODE:
                     abort_str = " [ABORT]" if abort else ""
                     print(
-                        f"Time: {t_now:.3f}s{abort_str} | θx: {np.rad2deg(theta_x):+6.2f}°, θy: {np.rad2deg(theta_y):+6.2f}° | "
-                        f"Kp_x: {pid_x.kp:.3f}, Ki_x: {pid_x.ki:.4f}, Kd_x: {pid_x.kd:.4f} | "
-                        f"Kp_y: {pid_y.kp:.3f}, Ki_y: {pid_y.ki:.4f}, Kd_y: {pid_y.kd:.4f} | "
-                        f"Tx: {Tx:+6.3f}, Ty: {Ty:+6.3f} | u1: {u1:+6.3f}, u2: {u2:+6.3f}, u3: {u3:+6.3f}"
+                        f"[BALANCE] t={t_now:.2f}s{abort_str} | "
+                        f"θ: ({np.rad2deg(theta_x):+5.1f}°, {np.rad2deg(theta_y):+5.1f}°) → "
+                        f"({np.rad2deg(theta_d_x):+5.1f}°, {np.rad2deg(theta_d_y):+5.1f}°) | "
+                        f"φ: ({phi_x:+5.2f}, {phi_y:+5.2f}) rad | "
+                        f"PID: Kp={pid_x.kp:.2f} Ki={pid_x.ki:.3f} Kd={pid_x.kd:.3f}"
                     )
                     if cur_tune == 0:
-                        print("Tuning Kp")
+                        print("  [Tuning Kp]")
                     elif cur_tune == 1:
-                        print("Tuning Kd")
+                        print("  [Tuning Kd]")
                     else:
-                        print("Tuning Ki")
+                        print("  [Tuning Ki]")
                 else:
                     print(
-                        f"[STEERING] t={t_now:6.3f}s | "
-                        f"θx={np.rad2deg(theta_x):+6.2f}° (d={np.rad2deg(theta_d_x):+6.2f}°) | "
-                        f"θy={np.rad2deg(theta_y):+6.2f}° (d={np.rad2deg(theta_d_y):+6.2f}°) | "
-                        f"fwd_cmd={js_fwd:+.2f}, strf_cmd={js_strafe:+.2f} | "
-                        f"Tx={Tx:+6.3f}, Ty={Ty:+6.3f} | "
-                        f"Kx(Kp,Ki,Kd)=({pid_x.kp:.3f},{pid_x.ki:.4f},{pid_x.kd:.4f}) | "
-                        f"Ky(Kp,Ki,Kd)=({pid_y.kp:.3f},{pid_y.ki:.4f},{pid_y.kd:.4f})"
+                        f"[STEERING] t={t_now:.2f}s | "
+                        f"θ: ({np.rad2deg(theta_x):+5.1f}°, {np.rad2deg(theta_y):+5.1f}°) → "
+                        f"({np.rad2deg(theta_d_x):+5.1f}°, {np.rad2deg(theta_d_y):+5.1f}°) | "
+                        f"φ: ({phi_x:+5.2f}, {phi_y:+5.2f}) rad | "
+                        f"Joy: ({js_strafe:+.2f}, {js_fwd:+.2f}) | "
+                        f"PID: Kp={pid_x.kp:.2f} Ki={pid_x.ki:.3f} Kd={pid_x.kd:.3f}"
                     )
                     if cur_tune == 0:
-                        print("    D-Pad tuning: Kp (both axes)")
+                        print("  [Tuning Kp]")
                     elif cur_tune == 1:
-                        print("    D-Pad tuning: Kd (both axes)")
+                        print("  [Tuning Kd]")
                     else:
-                        print("    D-Pad tuning: Ki (both axes)")
+                        print("  [Tuning Ki]")
 
             except KeyError:
                 print("Waiting for sensor data...")
