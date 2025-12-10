@@ -1,17 +1,16 @@
 """
 Ballbot Main Control Script
 ============================
-Balances a ballbot using PID control with drift correction.
+Balances a ballbot using PID control with optional drift correction.
 
 Controls:
   Triangle: Emergency stop
   Circle: Reset IMU & encoders
-  X: Toggle drift correction ON/OFF (for testing)
+  X: Toggle drift correction ON/OFF
   Square: Toggle Balance/Steering mode
-  L1 (Bumper): Zero integral terms (reduces oscillations)
   D-Pad: Tune PID gains (↑/↓ adjust, ←/→ switch parameter)
-  Right Stick: Steering (forward/strafe in steering mode)
-  Left Stick: Spinning (Tz control in steering mode)
+  Left Stick (horizontal): Tz turning/spinning (both modes)
+  Right Stick: Steering (when in steering mode)
 """
 
 import time
@@ -43,10 +42,10 @@ ALPHA = 45 * (np.pi/180)
 
 # Balance controller (inner loop - angle stabilization)
 BALANCE_KP = 8.5
-BALANCE_KI = 0.08  # Reduced from 0.15 to decrease oscillations
+BALANCE_KI = 20
 BALANCE_KD = 0.2
-BALANCE_INTEG_MIN = -0.10  # Tightened from -0.15 to prevent excessive accumulation
-BALANCE_INTEG_MAX = 0.10   # Tightened from 0.15 to prevent excessive accumulation
+BALANCE_INTEG_MIN = -0.15
+BALANCE_INTEG_MAX = 100
 
 # Drift correction (outer loop - position stabilization)
 # Penalizes movement to keep robot stationary while balancing
@@ -56,12 +55,12 @@ DRIFT_MAX_ANGLE = 0.02   # Max correction angle: ~1.15°
 DRIFT_POS_DEADZONE = 0.01  # Position deadzone in radians (~0.57°) - ignore small movements
 DRIFT_VEL_DEADZONE = 0.02  # Velocity deadzone in rad/s - ignore small velocities
 
-# Steering controller
+# Steering controller - using high kI logic like balance controller
 STEER_KP = 3.0           # Much lower - was causing oscillations at 10.0
-STEER_KI = 0.01          # Minimal integral
+STEER_KI = 7.0           # High integral like balance controller for steady state
 STEER_KD = 0.05          # More damping to prevent oscillations
-STEER_INTEG_MIN = -0.1
-STEER_INTEG_MAX = 0.1
+STEER_INTEG_MIN = -0.15
+STEER_INTEG_MAX = 100
 THETA_MAX_DEG = 2.0      # Larger max lean for steering (was 0.5° - too small!)
 THETA_MAX_RAD = np.deg2rad(THETA_MAX_DEG)
 TH_STEER_PRIOR_RAD = np.deg2rad(3.0)  # Balance priority threshold
@@ -159,11 +158,10 @@ def main():
     print("\nControls:")
     print("  Triangle = Emergency Stop")
     print("  Circle = Reset IMU & PIDs & Zero Encoders")
-    print("  X = Toggle Drift Correction ON/OFF (for testing)")
+    print("  X = Toggle Drift Correction ON/OFF")
     print("  Square = Toggle Balance/Steering Mode")
-    print("  L1 = Zero Integral Terms (bumper - reduces oscillations)")
-    print("  Right Stick = Steering (forward/strafe in steering mode)")
-    print("  Left Stick = Spinning (Tz control in steering mode)")
+    print("  Left Stick (horizontal) = Tz turning/spinning (both modes)")
+    print("  Right Stick = Steering (when in steering mode)")
     print("  D-Pad = Tune PID gains")
 
     # PID controllers
@@ -205,6 +203,7 @@ def main():
             "psi_1", "psi_2", "psi_3", "dpsi_1", "dpsi_2", "dpsi_3",
             "e_x", "e_y", "abort",
             "kp_x", "ki_x", "kd_x", "kp_y", "ki_y", "kd_y",
+            "p_x", "i_x", "d_x", "p_y", "i_y", "d_y",
         ]
         dl.appendData(header)
 
@@ -224,7 +223,7 @@ def main():
         print(f"IMU offsets: theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
 
         # Button states
-        prev_tri = prev_cir = prev_x = prev_sq = prev_l1 = 0
+        prev_tri = prev_cir = prev_x = prev_sq = 0
         prev_dpad_h = prev_dpad_vert = 0
 
         # Tuning
@@ -232,8 +231,8 @@ def main():
         cur_tune = 0  # 0=Kp, 1=Ki, 2=Kd
         tune_names = ["Kp", "Ki", "Kd"]
 
-        print("\n=== BALANCE MODE - Drift correction ENABLED ===")
-        print("    Place robot on ball, press Circle to zero. Drift correction is always active in balance mode.\n")
+        print("\n=== BALANCE MODE - Drift correction DISABLED ===")
+        print("    Place robot on ball, press Circle to zero, then press X to enable drift correction\n")
 
         # ========================================================================
         # MAIN CONTROL LOOP
@@ -258,7 +257,6 @@ def main():
                 cir = bt_signals.get("but_cir", 0)
                 but_x = bt_signals.get("but_x", 0)
                 but_sq = bt_signals.get("but_sq", 0)
-                but_l1 = bt_signals.get("but_l1", 0)
 
                 # D-pad: Select which parameter to tune
                 if dpad_h > prev_dpad_h:
@@ -322,15 +320,7 @@ def main():
                     mode = "BALANCE" if BALANCE_MODE else "STEERING"
                     print(f"Mode (Square): {mode}")
 
-                # L1: Zero integral terms (bumper to reduce oscillations)
-                if but_l1 and not prev_l1:
-                    pid_x._i = 0.0
-                    pid_y._i = 0.0
-                    pid_x_steer._i = 0.0
-                    pid_y_steer._i = 0.0
-                    print("L1 Bumper: Integral terms zeroed!")
-
-                prev_tri, prev_cir, prev_x, prev_sq, prev_l1 = tri, cir, but_x, but_sq, but_l1
+                prev_tri, prev_cir, prev_x, prev_sq = tri, cir, but_x, but_sq
 
                 # ================================================================
                 # READ SENSORS
@@ -383,21 +373,25 @@ def main():
 
                 # Compute desired tilt angles
                 if BALANCE_MODE:
-                    # Drift correction with deadzone: penalize movement to stay stationary
-                    # Apply position feedback only if outside deadzone
-                    pos_x = phi_x if abs(phi_x) > DRIFT_POS_DEADZONE else 0.0
-                    pos_y = phi_y if abs(phi_y) > DRIFT_POS_DEADZONE else 0.0
+                    if DRIFT_CORRECTION_ENABLED:
+                        # Drift correction with deadzone: penalize movement to stay stationary
+                        # Apply position feedback only if outside deadzone
+                        pos_x = -phi_x if abs(phi_x) > DRIFT_POS_DEADZONE else 0.0
+                        pos_y = -phi_y if abs(phi_y) > DRIFT_POS_DEADZONE else 0.0
 
-                    # Apply velocity damping only if outside deadzone
-                    vel_x = dphi_x if abs(dphi_x) > DRIFT_VEL_DEADZONE else 0.0
-                    vel_y = dphi_y if abs(dphi_y) > DRIFT_VEL_DEADZONE else 0.0
+                        # Apply velocity damping only if outside deadzone
+                        vel_x = -dphi_x if abs(dphi_x) > DRIFT_VEL_DEADZONE else 0.0
+                        vel_y = -dphi_y if abs(dphi_y) > DRIFT_VEL_DEADZONE else 0.0
 
-                    # Combine position and velocity feedback
-                    drift_x = DRIFT_KP * pos_x + DRIFT_KD * vel_x
-                    drift_y = DRIFT_KP * pos_y + DRIFT_KD * vel_y
+                        # Combine position and velocity feedback
+                        drift_x = DRIFT_KP * pos_x + DRIFT_KD * vel_x
+                        drift_y = DRIFT_KP * pos_y + DRIFT_KD * vel_y
 
-                    theta_d_x = func_clip(drift_x, -DRIFT_MAX_ANGLE, DRIFT_MAX_ANGLE)
-                    theta_d_y = func_clip(drift_y, -DRIFT_MAX_ANGLE, DRIFT_MAX_ANGLE)
+                        theta_d_x = func_clip(drift_x, -DRIFT_MAX_ANGLE, DRIFT_MAX_ANGLE)
+                        theta_d_y = func_clip(drift_y, -DRIFT_MAX_ANGLE, DRIFT_MAX_ANGLE)
+                    else:
+                        theta_d_x = 0.0
+                        theta_d_y = 0.0
                 else:
                     # Steering mode: WORLD FRAME control (joystick commands in world coordinates)
                     if abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS:
@@ -430,12 +424,12 @@ def main():
                     Ty_balance = pid_x.update(e_x, dt)  # roll -> Ty
 
                     if BALANCE_MODE:
-                        # Pure balance
+                        # Pure balance with Tz turning
                         pid_x_steer.reset()
                         pid_y_steer.reset()
                         Tx = func_clip(Tx_balance, -PWM_USER_CAP, PWM_USER_CAP)
                         Ty = func_clip(Ty_balance, -PWM_USER_CAP, PWM_USER_CAP)
-                        Tz = 0.0
+                        Tz = TZ_MAX * js_spin  # Spin control with left joystick
                     else:
                         # Balance + steering
                         if ((abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS) and
@@ -477,6 +471,10 @@ def main():
                 # ================================================================
                 # DATA LOGGING
                 # ================================================================
+                # Get individual PID terms for logging
+                p_x, i_x, d_x = pid_x.get_terms(e_x)
+                p_y, i_y, d_y = pid_y.get_terms(e_y)
+
                 data = [
                     i, t_now, Tx, Ty, Tz, u1, u2, u3,
                     np.rad2deg(theta_x), np.rad2deg(theta_y), np.rad2deg(theta_z),
@@ -485,6 +483,7 @@ def main():
                     psi_1, psi_2, psi_3, dpsi_1, dpsi_2, dpsi_3,
                     np.rad2deg(e_x), np.rad2deg(e_y), float(abort),
                     pid_x.kp, pid_x.ki, pid_x.kd, pid_y.kp, pid_y.ki, pid_y.kd,
+                    p_x, i_x, d_x, p_y, i_y, d_y,
                 ]
                 dl.appendData(data)
 
@@ -500,13 +499,13 @@ def main():
                           f"d=[{np.rad2deg(theta_d_x):+4.1f}°,{np.rad2deg(theta_d_y):+4.1f}°] | "
                           f"φ=[{phi_x:+5.2f},{phi_y:+5.2f}] | Drift:{drift_str}")
                     print(f"      PID: Kp={pid_x.kp:.2f} Ki={pid_x.ki:.3f} Kd={pid_x.kd:.3f} | "
-                          f"T=[{Tx:+5.2f},{Ty:+5.2f}] | Tuning: {tune_names[cur_tune]}")
+                          f"T=[{Tx:+5.2f},{Ty:+5.2f},{Tz:+5.2f}] | Tuning: {tune_names[cur_tune]}")
                 else:
                     print(f"[STR] t={t_now:6.2f}s{abort_str} | "
                           f"θ=[{np.rad2deg(theta_x):+5.1f}°,{np.rad2deg(theta_y):+5.1f}°] "
                           f"d=[{np.rad2deg(theta_d_x):+5.1f}°,{np.rad2deg(theta_d_y):+5.1f}°] | "
-                          f"js=[{js_fwd:+.2f},{js_strafe:+.2f},spin:{js_spin:+.2f}]")
-                    print(f"      BAL Kp={pid_x.kp:.2f} | STR Kp={pid_x_steer.kp:.2f} | "
+                          f"js=[{js_fwd:+.2f},{js_strafe:+.2f}]")
+                    print(f"      BAL Kp={pid_x.kp:.2f} Ki={pid_x.ki:.3f} | STR Kp={pid_x_steer.kp:.2f} Ki={pid_x_steer.ki:.3f} | "
                           f"T=[{Tx:+5.2f},{Ty:+5.2f},{Tz:+5.2f}] | Tuning: {tune_names[cur_tune]}")
 
             except KeyError:

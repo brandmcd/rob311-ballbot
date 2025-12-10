@@ -14,15 +14,27 @@ class PID:
     
     # Anti-windup: stop integrating when saturated
     enable_antiwindup: bool = True
-    
+
+    # Integral auto-reset: reset integral when error is small for a duration
+    enable_integral_reset: bool = True
+    integral_reset_threshold: float = 0.5  # degrees (will be converted to radians)
+    integral_reset_time: float = 5.0  # seconds - how long error must be small
+
+    # Integral reset on direction change: reset when error changes sign significantly
+    enable_direction_reset: bool = True
+    direction_reset_threshold: float = 2.0  # degrees - reset if error changes by this much
+
     _e_prev: float = 0.0
     _i: float = 0.0
     _d_filtered: float = 0.0
     _init: bool = False
-    
+
     # For derivative filtering - track last few error derivatives
     _d_history: list = None
     _d_history_max: int = 5
+
+    # For integral reset - track how long error has been small
+    _low_error_timer: float = 0.0
 
     def __post_init__(self):
         self._d_filtered = 0.0
@@ -34,14 +46,24 @@ class PID:
         self._d_filtered = 0.0
         self._init = False
         self._d_history = []
+        self._low_error_timer = 0.0
 
     def update(self, error: float, dt: float) -> float:
         if dt <= 0:
             return 0.0
-        
+
+        # === DIRECTION CHANGE RESET ===
+        # Reset integral if error changes direction significantly (prevents oscillations)
+        if self.enable_direction_reset and self._init:
+            error_change_deg = np.rad2deg(abs(error - self._e_prev))
+            # If error changed sign AND magnitude changed significantly, reset integral
+            if (np.sign(error) != np.sign(self._e_prev) and
+                error_change_deg > self.direction_reset_threshold):
+                self._i = 0.0
+
         # === PROPORTIONAL ===
         p_term = self.kp * error
-        
+
         # === INTEGRAL with anti-windup ===
         # Calculate what output would be without integral
         d_raw = (error - self._e_prev) / dt if self._init else 0.0
@@ -63,7 +85,26 @@ class PID:
         # Clamp integral
         self._i = np.clip(self._i, self.integ_min, self.integ_max)
         i_term = self.ki * self._i
-        
+
+        # === INTEGRAL AUTO-RESET ===
+        # Reset integral if error has been small for a sustained period
+        if self.enable_integral_reset:
+            # Convert error to degrees for threshold comparison
+            error_deg = np.rad2deg(abs(error))
+
+            if error_deg < self.integral_reset_threshold:
+                # Error is small, increment timer
+                self._low_error_timer += dt
+
+                # If error has been small long enough, reset integral
+                if self._low_error_timer >= self.integral_reset_time:
+                    self._i = 0.0
+                    i_term = 0.0
+                    self._low_error_timer = 0.0  # Reset timer after reset
+            else:
+                # Error is not small, reset timer
+                self._low_error_timer = 0.0
+
         # === DERIVATIVE with improved filtering ===
         if self._init:
             # Use moving average of derivatives to reduce noise spikes
