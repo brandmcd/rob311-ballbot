@@ -2,15 +2,19 @@
 Ballbot Main Control Script
 ============================
 Balances a ballbot using PID control with optional drift correction.
+Robot-centered steering with priority switching at critical angle.
 
 Controls:
   Triangle: Emergency stop
-  Circle: Reset IMU & encoders
+  Circle: Reset IMU & encoders & PIDs
   X: Toggle drift correction ON/OFF
   Square: Toggle Balance/Steering mode
+  L1 (Left Bumper): Zero integral term (reset integrator windup)
   D-Pad: Tune PID gains (↑/↓ adjust, ←/→ switch parameter)
   Left Stick (horizontal): Tz turning/spinning (both modes)
-  Right Stick: Steering (when in steering mode)
+  Right Stick: Steering in robot frame (when in steering mode)
+    - Prioritizes steering when angle < 1.5°
+    - Prioritizes balance when angle > 1.5°
 """
 
 import time
@@ -43,9 +47,10 @@ ALPHA = 45 * (np.pi/180)
 # Balance controller (inner loop - angle stabilization)
 BALANCE_KP = 8.5
 BALANCE_KI = 20
-BALANCE_KD = 0.2
-BALANCE_INTEG_MIN = -0.15
-BALANCE_INTEG_MAX = 100
+BALANCE_KD = 0.02
+# Integral limits: with Ki=20, max integral contribution = 20 * 0.025 = 0.5
+BALANCE_INTEG_MIN = -0.025
+BALANCE_INTEG_MAX = 0.025  # Keep integral oscillating, not accumulating
 
 # Drift correction (outer loop - position stabilization)
 # Penalizes movement to keep robot stationary while balancing
@@ -55,15 +60,18 @@ DRIFT_MAX_ANGLE = 0.02   # Max correction angle: ~1.15°
 DRIFT_POS_DEADZONE = 0.01  # Position deadzone in radians (~0.57°) - ignore small movements
 DRIFT_VEL_DEADZONE = 0.02  # Velocity deadzone in rad/s - ignore small velocities
 
-# Steering controller - using high kI logic like balance controller
-STEER_KP = 3.0           # Much lower - was causing oscillations at 10.0
-STEER_KI = 7.0           # High integral like balance controller for steady state
-STEER_KD = 0.05          # More damping to prevent oscillations
-STEER_INTEG_MIN = -0.15
-STEER_INTEG_MAX = 100
-THETA_MAX_DEG = 2.0      # Larger max lean for steering (was 0.5° - too small!)
+# Steering controller - robot-centered approach with priority switching
+# Gains need to be strong enough to hold commanded lean angle
+STEER_KP = 8.5   # Match balance Kp for good angle tracking
+STEER_KI = 20    # Match balance Ki to eliminate steady-state error
+STEER_KD = 0.02   # Match balance Kd for damping
+# Integral limits: with Ki=20, max integral contribution = 20 * 0.025 = 0.5
+STEER_INTEG_MIN = -0.025
+STEER_INTEG_MAX = 0.025  # Keep integral oscillating, not accumulating
+THETA_MAX_DEG = 1.75     # Maximum steering lean angle
 THETA_MAX_RAD = np.deg2rad(THETA_MAX_DEG)
-TH_STEER_PRIOR_RAD = np.deg2rad(3.0)  # Balance priority threshold
+CRITICAL_ANGLE_DEG = 1.5  # Critical angle: prioritize steer below, balance above
+CRITICAL_ANGLE_RAD = np.deg2rad(CRITICAL_ANGLE_DEG)
 VEL_CMD_EPS = 1e-3
 TZ_MAX = 0.3             # Maximum Tz (spinning) torque PWM value
 
@@ -160,6 +168,7 @@ def main():
     print("  Circle = Reset IMU & PIDs & Zero Encoders")
     print("  X = Toggle Drift Correction ON/OFF")
     print("  Square = Toggle Balance/Steering Mode")
+    print("  L1 (Left Bumper) = Zero Integral Term")
     print("  Left Stick (horizontal) = Tz turning/spinning (both modes)")
     print("  Right Stick = Steering (when in steering mode)")
     print("  D-Pad = Tune PID gains")
@@ -169,25 +178,25 @@ def main():
         kp=BALANCE_KP, ki=BALANCE_KI, kd=BALANCE_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
         integ_min=BALANCE_INTEG_MIN, integ_max=BALANCE_INTEG_MAX,
-        d_window=5, enable_antiwindup=True
+        d_window=5, enable_antiwindup=True, enable_integral_reset=True
     )
     pid_y = PID(
         kp=BALANCE_KP, ki=BALANCE_KI, kd=BALANCE_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
         integ_min=BALANCE_INTEG_MIN, integ_max=BALANCE_INTEG_MAX,
-        d_window=5, enable_antiwindup=True
+        d_window=5, enable_antiwindup=True, enable_integral_reset=True
     )
     pid_x_steer = PID(
         kp=STEER_KP, ki=STEER_KI, kd=STEER_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
         integ_min=STEER_INTEG_MIN, integ_max=STEER_INTEG_MAX,
-        d_window=5, enable_antiwindup=True
+        d_window=5, enable_antiwindup=True, enable_integral_reset=True
     )
     pid_y_steer = PID(
         kp=STEER_KP, ki=STEER_KI, kd=STEER_KD,
         u_min=-PWM_USER_CAP, u_max=PWM_USER_CAP,
         integ_min=STEER_INTEG_MIN, integ_max=STEER_INTEG_MAX,
-        d_window=5, enable_antiwindup=True
+        d_window=5, enable_antiwindup=True, enable_integral_reset=True
     )
 
     try:
@@ -223,7 +232,7 @@ def main():
         print(f"IMU offsets: theta_x_0={theta_x_0:.4f}, theta_y_0={theta_y_0:.4f}, theta_z_0={theta_z_0:.4f}")
 
         # Button states
-        prev_tri = prev_cir = prev_x = prev_sq = 0
+        prev_tri = prev_cir = prev_x = prev_sq = prev_l1 = 0
         prev_dpad_h = prev_dpad_vert = 0
 
         # Tuning
@@ -257,6 +266,7 @@ def main():
                 cir = bt_signals.get("but_cir", 0)
                 but_x = bt_signals.get("but_x", 0)
                 but_sq = bt_signals.get("but_sq", 0)
+                but_l1 = bt_signals.get("but_l1", 0)
 
                 # D-pad: Select which parameter to tune
                 if dpad_h > prev_dpad_h:
@@ -320,7 +330,18 @@ def main():
                     mode = "BALANCE" if BALANCE_MODE else "STEERING"
                     print(f"Mode (Square): {mode}")
 
-                prev_tri, prev_cir, prev_x, prev_sq = tri, cir, but_x, but_sq
+                # L1: Zero integral term (reset integrator windup)
+                if but_l1 and not prev_l1:
+                    # Reset integral terms for active controllers
+                    pid_x.reset_integral()
+                    pid_y.reset_integral()
+                    if not BALANCE_MODE:
+                        # Also reset steering integral if in steering mode
+                        pid_x_steer.reset_integral()
+                        pid_y_steer.reset_integral()
+                    print(f"Integral terms zeroed (L1)")
+
+                prev_tri, prev_cir, prev_x, prev_sq, prev_l1 = tri, cir, but_x, but_sq, but_l1
 
                 # ================================================================
                 # READ SENSORS
@@ -393,22 +414,12 @@ def main():
                         theta_d_x = 0.0
                         theta_d_y = 0.0
                 else:
-                    # Steering mode: WORLD FRAME control (joystick commands in world coordinates)
+                    # Steering mode: ROBOT-CENTERED (body frame) control
                     if abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS:
-                        # Joystick commands in world frame
-                        world_fwd = -js_fwd      # Forward in world frame
-                        world_strafe = js_strafe # Right in world frame
-
-                        # Rotate to body frame using yaw angle (theta_z)
-                        # Body frame commands = Rotation matrix * World frame commands
-                        cos_yaw = np.cos(theta_z)
-                        sin_yaw = np.sin(theta_z)
-                        body_fwd = cos_yaw * world_fwd - sin_yaw * world_strafe
-                        body_strafe = sin_yaw * world_fwd + cos_yaw * world_strafe
-
-                        # Convert to desired tilt angles
-                        theta_d_x = THETA_MAX_RAD * body_strafe
-                        theta_d_y = THETA_MAX_RAD * body_fwd
+                        # Direct mapping: joystick commands directly to robot tilt angles
+                        # Forward stick -> pitch (theta_y), Right stick -> roll (theta_x)
+                        theta_d_x = THETA_MAX_RAD * js_strafe  # Right stick -> roll
+                        theta_d_y = THETA_MAX_RAD * (-js_fwd)  # Forward stick -> pitch
                     else:
                         theta_d_x = 0.0
                         theta_d_y = 0.0
@@ -419,31 +430,47 @@ def main():
 
                 # Compute control torques
                 if not abort:
-                    # Balance controller (always active)
-                    Tx_balance = pid_y.update(e_y, dt)  # pitch -> Tx
-                    Ty_balance = pid_x.update(e_x, dt)  # roll -> Ty
-
                     if BALANCE_MODE:
                         # Pure balance with Tz turning
                         pid_x_steer.reset()
                         pid_y_steer.reset()
+                        Tx_balance = pid_y.update(e_y, dt)  # pitch -> Tx
+                        Ty_balance = pid_x.update(e_x, dt)  # roll -> Ty
                         Tx = func_clip(Tx_balance, -PWM_USER_CAP, PWM_USER_CAP)
                         Ty = func_clip(Ty_balance, -PWM_USER_CAP, PWM_USER_CAP)
                         Tz = TZ_MAX * js_spin  # Spin control with left joystick
                     else:
-                        # Balance + steering
-                        if ((abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS) and
-                            abs(theta_x) < TH_STEER_PRIOR_RAD and abs(theta_y) < TH_STEER_PRIOR_RAD):
-                            Tx_steer = pid_y_steer.update(e_y, dt)
-                            Ty_steer = pid_x_steer.update(e_x, dt)
+                        # Steering mode: PRIORITY SWITCHING between steer and balance
+                        # When angle is small (< 1.5°), prioritize steering for control
+                        # When angle is large (> 1.5°), prioritize balance for stability
+
+                        angle_magnitude = max(abs(theta_x), abs(theta_y))
+
+                        if angle_magnitude < CRITICAL_ANGLE_RAD:
+                            # STEERING PRIORITY: angle is small, focus on steering control
+                            if abs(js_fwd) > VEL_CMD_EPS or abs(js_strafe) > VEL_CMD_EPS:
+                                # Use steering controller
+                                Tx = pid_y_steer.update(e_y, dt)
+                                Ty = pid_x_steer.update(e_x, dt)
+                                # Reset balance PIDs to prevent windup
+                                pid_x.reset()
+                                pid_y.reset()
+                            else:
+                                # No joystick input: use balance to stay upright
+                                Tx = pid_y.update(e_y, dt)
+                                Ty = pid_x.update(e_x, dt)
+                                pid_x_steer.reset()
+                                pid_y_steer.reset()
                         else:
+                            # BALANCE PRIORITY: angle exceeded critical threshold, stabilize first
+                            Tx = pid_y.update(e_y, dt)
+                            Ty = pid_x.update(e_x, dt)
+                            # Reset steering PIDs
                             pid_x_steer.reset()
                             pid_y_steer.reset()
-                            Tx_steer = 0.0
-                            Ty_steer = 0.0
 
-                        Tx = func_clip(Tx_balance + Tx_steer, -PWM_USER_CAP, PWM_USER_CAP)
-                        Ty = func_clip(Ty_balance + Ty_steer, -PWM_USER_CAP, PWM_USER_CAP)
+                        Tx = func_clip(Tx, -PWM_USER_CAP, PWM_USER_CAP)
+                        Ty = func_clip(Ty, -PWM_USER_CAP, PWM_USER_CAP)
                         Tz = TZ_MAX * js_spin  # Direct spin control with left joystick
                 else:
                     # Emergency stop
@@ -501,7 +528,9 @@ def main():
                     print(f"      PID: Kp={pid_x.kp:.2f} Ki={pid_x.ki:.3f} Kd={pid_x.kd:.3f} | "
                           f"T=[{Tx:+5.2f},{Ty:+5.2f},{Tz:+5.2f}] | Tuning: {tune_names[cur_tune]}")
                 else:
-                    print(f"[STR] t={t_now:6.2f}s{abort_str} | "
+                    angle_magnitude = max(abs(theta_x), abs(theta_y))
+                    priority = "STEER" if angle_magnitude < CRITICAL_ANGLE_RAD else "BALANCE"
+                    print(f"[STR] t={t_now:6.2f}s{abort_str} | Priority:{priority} | "
                           f"θ=[{np.rad2deg(theta_x):+5.1f}°,{np.rad2deg(theta_y):+5.1f}°] "
                           f"d=[{np.rad2deg(theta_d_x):+5.1f}°,{np.rad2deg(theta_d_y):+5.1f}°] | "
                           f"js=[{js_fwd:+.2f},{js_strafe:+.2f}]")

@@ -5,6 +5,9 @@ Visualizes P, I, D terms and error for both X and Y axes.
 """
 
 import numpy as np
+import matplotlib
+# Use Agg backend by default for headless operation
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import argparse
 import sys
@@ -205,10 +208,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s main_control_1.txt                    # Plot both axes
-  %(prog)s main_control_1.txt --axis x           # Plot only X axis
-  %(prog)s main_control_1.txt --combined         # Combined view
-  %(prog)s main_control_1.txt --save output.png  # Save to file
+  %(prog)s main_control_1.txt                    # Save both axes to main_control_1_pid_x_axis.png and main_control_1_pid_y_axis.png
+  %(prog)s main_control_1.txt --axis x           # Save only X axis to main_control_1_pid.png
+  %(prog)s main_control_1.txt --combined         # Save combined view to main_control_1_combined.png
+  %(prog)s main_control_1.txt --save custom.png  # Save to custom filename
+  %(prog)s main_control_1.txt --show             # Display plots interactively instead of saving
         """
     )
 
@@ -220,9 +224,9 @@ Examples:
     parser.add_argument('--stats', action='store_true',
                         help='Print statistics')
     parser.add_argument('--save', type=str, metavar='FILE',
-                        help='Save plot to file instead of showing')
-    parser.add_argument('--no-show', action='store_true',
-                        help='Do not display plots (useful with --save)')
+                        help='Save plot to specific filename (default: auto-generate from logfile name)')
+    parser.add_argument('--show', action='store_true',
+                        help='Display plots interactively (default: save to PNG file)')
 
     args = parser.parse_args()
 
@@ -259,19 +263,29 @@ Examples:
 
     # Save or show plots
     if args.save:
-        if len(figures) == 1:
-            figures[0].savefig(args.save, dpi=150, bbox_inches='tight')
-            print(f"Saved plot to {args.save}")
+        save_filename = args.save
+    else:
+        # Auto-generate filename from logfile name
+        base_name = Path(args.logfile).stem
+        if args.combined:
+            save_filename = f"{base_name}_combined.png"
         else:
-            # Save multiple figures with suffixes
-            base_name = Path(args.save).stem
-            extension = Path(args.save).suffix
-            for i, (fig, name) in enumerate(zip(figures, ['x_axis', 'y_axis'])):
-                filename = f"{base_name}_{name}{extension}"
-                fig.savefig(filename, dpi=150, bbox_inches='tight')
-                print(f"Saved plot to {filename}")
+            save_filename = f"{base_name}_pid.png"
 
-    if not args.no_show:
+    if len(figures) == 1:
+        figures[0].savefig(save_filename, dpi=150, bbox_inches='tight')
+        print(f"Saved plot to {save_filename}")
+    else:
+        # Save multiple figures with suffixes
+        base_name = Path(save_filename).stem
+        extension = Path(save_filename).suffix
+        for i, (fig, name) in enumerate(zip(figures, ['x_axis', 'y_axis'])):
+            filename = f"{base_name}_{name}{extension}"
+            fig.savefig(filename, dpi=150, bbox_inches='tight')
+            print(f"Saved plot to {filename}")
+
+    if args.show:
+        # Only show if explicitly requested
         plt.show()
 
 

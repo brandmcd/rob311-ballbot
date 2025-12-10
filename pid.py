@@ -8,8 +8,8 @@ class PID:
     kd: float = 0.0
     u_min: float = -1
     u_max: float = 1
-    integ_min: float = -0.25
-    integ_max: float = 0.25
+    integ_min: float = -0.025  # Tight limits to keep integral oscillating
+    integ_max: float = 0.025   # Not accumulating on one side
     d_window: int = 5
     
     # Anti-windup: stop integrating when saturated
@@ -17,12 +17,12 @@ class PID:
 
     # Integral auto-reset: reset integral when error is small for a duration
     enable_integral_reset: bool = True
-    integral_reset_threshold: float = 0.5  # degrees (will be converted to radians)
-    integral_reset_time: float = 5.0  # seconds - how long error must be small
+    integral_reset_threshold: float = 2.0  # degrees - reset when error small
+    integral_reset_time: float = 1.0  # seconds - reset quickly to keep oscillating
 
     # Integral reset on direction change: reset when error changes sign significantly
     enable_direction_reset: bool = True
-    direction_reset_threshold: float = 2.0  # degrees - reset if error changes by this much
+    direction_reset_threshold: float = 1.0  # degrees - reset quickly when oscillating
 
     _e_prev: float = 0.0
     _i: float = 0.0
@@ -46,6 +46,11 @@ class PID:
         self._d_filtered = 0.0
         self._init = False
         self._d_history = []
+        self._low_error_timer = 0.0
+
+    def reset_integral(self):
+        """Reset only the integral term (useful for clearing windup)"""
+        self._i = 0.0
         self._low_error_timer = 0.0
 
     def update(self, error: float, dt: float) -> float:
